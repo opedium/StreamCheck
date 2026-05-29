@@ -1,0 +1,33 @@
+[Unit]
+Description=StreamMonitor - Douyin Live Stream Weibo Notifier
+Documentation=https://github.com/yourusername/StreamMonitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Path to the project directory - CHANGE THIS to match your deployment path
+WorkingDirectory=/opt/StreamCheck/StreamMonitor
+
+# Path to Python and the main script
+ExecStart=/usr/bin/python3 /opt/StreamCheck/StreamMonitor/main.py --record-stats
+
+# Auto-restart on failure (including crashes, network blips, etc.)
+Restart=always
+RestartSec=30
+
+# Logging
+StandardOutput=append:/var/log/streammonitor/streammonitor.log
+StandardError=append:/var/log/streammonitor/streammonitor-error.log
+
+# Security hardening (recommended)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

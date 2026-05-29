@@ -1,0 +1,15 @@
+# Environment config (contains secrets)
+.env
+
+# Notification log
+notification_log.json
+
+# Loguru log files
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
