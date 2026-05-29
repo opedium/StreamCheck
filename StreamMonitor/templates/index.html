@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamMonitor - 抖音直播监控服务</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+        .header {
+            max-width: 1200px;
+            margin: 0 auto 40px;
+            text-align: center;
+        }
+        .header h1 {
+            font-size: 36px;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+        .header p {
+            color: #a0a0b0;
+            font-size: 16px;
+        }
+        .grid {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+            margin-bottom: 40px;
+        }
+        .section {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+            border-radius: 16px;
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+        .section.full {
+            grid-column: 1 / -1;
+        }
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #fff;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .overview {
+            color: #d0d0d0;
+            line-height: 1.8;
+            margin-bottom: 16px;
+        }
+        .feature-list {
+            list-style: none;
+            margin-top: 16px;
+        }
+        .feature-list li {
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+        .feature-list li:last-child {
+            border-bottom: none;
+        }
+        .feature-list li:before {
+            content: "✓";
+            color: #2ed573;
+            font-weight: bold;
+            min-width: 20px;
+        }
+        .status-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        .stat-card {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .stat-label {
+            font-size: 12px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #2ed573;
+        }
+        .stat-value.orange {
+            color: #ffa502;
+        }
+        .stat-value.normal {
+            color: #fff;
+        }
+        .pulse {
+            width: 10px;
+            height: 10px;
+            background: #2ed573;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.2); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+        .endpoints {
+            margin-top: 20px;
+        }
+        .endpoint {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .endpoint-method {
+            display: inline-block;
+            padding: 3px 12px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+            margin-right: 12px;
+            background: rgba(46, 213, 115, 0.15);
+            color: #2ed573;
+        }
+        .endpoint-path {
+            font-family: 'Courier New', monospace;
+            color: #c0c0d0;
+            flex: 1;
+            font-size: 13px;
+        }
+        .endpoint-desc {
+            color: #666;
+            font-size: 12px;
+            text-align: right;
+        }
+        .recent-events {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .event {
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border-left: 3px solid #2ed573;
+            font-size: 13px;
+        }
+        .event.error {
+            border-left-color: #ff4757;
+        }
+        .event-time {
+            color: #888;
+            font-size: 11px;
+        }
+        .event-msg {
+            color: #e0e0e0;
+            margin-top: 4px;
+        }
+        .footer {
+            max-width: 1200px;
+            margin: 40px auto 0;
+            text-align: center;
+            font-size: 12px;
+            color: #555;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .loading {
+            color: #888;
+            font-style: italic;
+        }
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+            .status-grid {
+                grid-template-columns: 1fr;
+            }
+            .header h1 {
+                font-size: 28px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 StreamMonitor</h1>
+        <p>抖音直播自动监控 & 微博通知系统</p>
+    </div>
+
+    <div class="grid">
+        <!-- 程序概览 -->
+        <div class="section">
+            <div class="section-title">📋 程序概览</div>
+            <div class="overview">
+                <strong>StreamMonitor</strong> 是一个全自动化的抖音直播监控系统，能够：
+            </div>
+            <ul class="feature-list">
+                <li>持续监控抖音直播间状态</li>
+                <li>直播开启时自动发布微博通知</li>
+                <li>直播结束时发送详细的统计数据</li>
+                <li>记录所有通知历史日志</li>
+                <li>提供 REST API 接口查询状态</li>
+                <li>24/7 不间断运行监控</li>
+            </ul>
+        </div>
+
+        <!-- 实时状态 -->
+        <div class="section">
+            <div class="section-title">⚡ 实时状态</div>
+            <div class="status-grid">
+                <div class="stat-card">
+                    <div class="stat-label">服务状态</div>
+                    <div class="stat-value"><span class="pulse"></span>运行中</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">服务运行时长</div>
+                    <div class="stat-value normal" id="uptime">0h</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">监控进程</div>
+                    <div class="stat-value" id="monitor-status">检查中...</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">当前时间</div>
+                    <div class="stat-value normal" id="current-time">--</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 工作原理 -->
+        <div class="section">
+            <div class="section-title">🔄 工作原理</div>
+            <div class="overview">
+                <strong>三步监控流程：</strong>
+            </div>
+            <ul class="feature-list">
+                <li><strong>检测状态：</strong> 每30秒检查一次直播间状态</li>
+                <li><strong>识别变化：</strong> 检测离线→在线 或 在线→离线</li>
+                <li><strong>发送通知：</strong> 自动发布微博并记录详细日志</li>
+            </ul>
+            <div class="overview" style="margin-top: 16px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
+                <strong>核心功能：</strong>
+                <ul class="feature-list">
+                    <li>使用 Douyin API 实时查询直播状态</li>
+                    <li>通过微博 Cookie 自动发布通知</li>
+                    <li>完整的统计数据（观看数、点赞、粉丝等）</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- API 接口 -->
+        <div class="section">
+            <div class="section-title">📡 API 接口</div>
+            <div class="endpoints">
+                <div class="endpoint">
+                    <div>
+                        <span class="endpoint-method">GET</span>
+                        <span class="endpoint-path">/</span>
+                    </div>
+                    <div class="endpoint-desc">状态页面</div>
+                </div>
+                <div class="endpoint">
+                    <div>
+                        <span class="endpoint-method">GET</span>
+                        <span class="endpoint-path">/api/health</span>
+                    </div>
+                    <div class="endpoint-desc">健康检查</div>
+                </div>
+                <div class="endpoint">
+                    <div>
+                        <span class="endpoint-method">GET</span>
+                        <span class="endpoint-path">/api/status</span>
+                    </div>
+                    <div class="endpoint-desc">监控状态</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 最近事件 -->
+        <div class="section full">
+            <div class="section-title">📝 最近事件日志</div>
+            <div class="recent-events" id="recent-events">
+                <div class="loading">加载中...</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        StreamMonitor &copy; 2026 &middot; 由 Flask 驱动 &middot; <a href="/api/health" style="color: #2ed573; text-decoration: none;">API 文档</a>
+    </div>
+
+    <script>
+        // 更新当前时间
+        function updateTime() {
+            const now = new Date();
+            document.getElementById('current-time').textContent = now.toLocaleTimeString('zh-CN', { hour12: false });
+        }
+        updateTime();
+        setInterval(updateTime, 1000);
+
+        // 获取健康状态
+        function updateHealth() {
+            fetch('/api/health')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('uptime').textContent = data.uptime;
+                })
+                .catch(e => console.error('获取健康状态失败:', e));
+        }
+        updateHealth();
+        setInterval(updateHealth, 5000);
+
+        // 获取监控状态和事件日志
+        function updateStatus() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    // 更新监控进程状态
+                    let monitorStatus = '';
+                    let statusClass = '';
+                    
+                    if (data.monitor.running === true) {
+                        monitorStatus = '✓ 运行中';
+                        statusClass = 'stat-value';
+                    } else if (data.monitor.running === false) {
+                        monitorStatus = '✗ 停止';
+                        statusClass = 'stat-value orange';
+                    } else {
+                        // Running is null/unknown (e.g., on Windows dev environment)
+                        monitorStatus = '⚙ 无法检测';
+                        statusClass = 'stat-value orange';
+                    }
+                    
+                    const statusEl = document.getElementById('monitor-status');
+                    statusEl.textContent = monitorStatus;
+                    statusEl.className = statusClass;
+
+                    // 更新最近事件
+                    const eventsContainer = document.getElementById('recent-events');
+                    if (data.recent_events && data.recent_events.length > 0) {
+                        eventsContainer.innerHTML = data.recent_events.reverse().map(event => {
+                            const time = new Date(event.timestamp).toLocaleString('zh-CN');
+                            const isError = event.success === false;
+                            return `
+                                <div class="event ${isError ? 'error' : ''}">
+                                    <div class="event-time">${time}</div>
+                                    <div class="event-msg">
+                                        <strong>${event.event}</strong>: ${event.content}
+                                    </div>
+                                </div>
+                            `;
+                        }).join('');
+                    } else {
+                        eventsContainer.innerHTML = '<div class="loading">暂无事件记录</div>';
+                    }
+                })
+                .catch(e => console.error('获取状态失败:', e));
+        }
+        updateStatus();
+        setInterval(updateStatus, 10000);
+    </script>
+</body>
+</html>
