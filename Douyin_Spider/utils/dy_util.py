@@ -52,6 +52,19 @@ except:
     sign_path = path.join(basedir, '..', 'static', 'dy_live_sign.js')
     sign_js = execjs.compile(open(sign_path, 'r', encoding='utf-8').read(), cwd=node_modules)
 
+# Also try to compile the cleaner a_bogus.js (389 lines, no self-destruct)
+# from DouyinLiveWebFetcher, used as fallback when dy_ab.js crashes.
+# Note: compiled WITHOUT cwd since a_bogus.js is self-contained (no node_modules required).
+_abogus_js_ctx = None
+try:
+    ab_path = path.join(basedir, 'static', 'a_bogus.js')
+    if not path.exists(ab_path):
+        ab_path = path.join(basedir, '..', 'static', 'a_bogus.js')
+    if path.exists(ab_path):
+        _abogus_js_ctx = execjs.compile(open(ab_path, 'r', encoding='utf-8').read())
+except Exception:
+    _abogus_js_ctx = None
+
 
 def trans_cookies(cookies_str):
     cookies = {
@@ -74,15 +87,149 @@ def generate_req_sign(e, priK):
 
 # query, data都是拼接字符串
 def generate_a_bogus(query, data=""):
-    a_bogus = dy_js.call('get_ab', query, data)
-    return a_bogus
+    """
+    Generate a_bogus by calling Node.js directly via subprocess.
+    
+    execjs can NOT be used because the old dy_ab.js calls process.exit(-6) after
+    computing signatures, which kills execjs's shared Node.js subprocess and poisons
+    ALL subsequent execjs calls (even fresh compiles).
+    
+    Using subprocess ensures each call gets a fresh, isolated Node.js process.
+    
+    JS signature: get_ab(dpf, ua) where:
+      - dpf = URL-encoded query string (query + data combined)
+      - ua  = User-Agent string
+    """
+    # Combine query and data into one dpf string for the new JS interface
+    if data:
+        dpf = query + '&' + data if query else data
+    else:
+        dpf = query
+    
+    # Hardcode UA to avoid circular import (builder.header imports from dy_util).
+    # IMPORTANT: This must match HeaderBuilder.ua in builder/header.py.
+    # The a_bogus.js signature algorithm incorporates the UA string, so a mismatch
+    # between the signed UA and the HTTP User-Agent header causes request rejection.
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    
+    # Find a_bogus.js path
+    ab_path = path.join(basedir, 'static', 'a_bogus.js')
+    if not path.exists(ab_path):
+        ab_path = path.join(basedir, '..', 'static', 'a_bogus.js')
+    
+    if not path.exists(ab_path):
+        raise RuntimeError(f"a_bogus.js not found at {ab_path}")
+    
+    # Build Node.js script: eval the file (defines get_ab globally), then call it
+    # json.dumps safely escapes Python strings for use in JS string literals
+    js_code = (
+        "eval(require('fs').readFileSync(" + json.dumps(ab_path) + ",'utf-8'));"
+        "var r=get_ab(" + json.dumps(dpf) + "," + json.dumps(ua) + ");"
+        "console.log(JSON.stringify({a_bogus:r}));"
+    )
+    
+    try:
+        proc = subprocess.run(
+            ['node', '-e', js_code],
+            capture_output=True, text=True, timeout=15, encoding='utf-8'
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("generate_a_bogus: Node.js subprocess timed out (15s)")
+    
+    # Parse JSON output from stdout FIRST — Node.js may exit with code -6 even when stdout
+    # contains a valid a_bogus (e.g., Node.js v24 behavior, or JS engine internal exit).
+    # We should NOT reject based on returncode alone if we already have a valid result.
+    for line in proc.stdout.strip().split('\n'):
+        line = line.strip()
+        try:
+            obj = json.loads(line)
+            if 'a_bogus' in obj:
+                return obj['a_bogus']
+        except json.JSONDecodeError:
+            continue
+    
+    # Only raise if BOTH returncode != 0 AND stdout parsing failed to find a_bogus
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"generate_a_bogus: Node.js exited with code {proc.returncode}: "
+            f"stderr={proc.stderr[:300]} stdout={proc.stdout[:300]}"
+        )
+    
+    raise RuntimeError(f"generate_a_bogus: could not parse result: stdout={proc.stdout[:300]}")
 
 
 def generate_signature(room_id, user_unique_id):
+    """
+    Generate X-Bogus signature for Douyin live WebSocket connection.
+    
+    Uses subprocess instead of execjs because dy_live_sign.js calls process.exit(-6)
+    internally after computing signatures, which kills execjs's shared Node.js subprocess.
+    
+    Using subprocess ensures each call gets a fresh, isolated Node.js process.
+    
+    Returns the X-Bogus string.
+    """
     raw_string = f"live_id=1,aid=6383,version_code=180800,webcast_sdk_version=1.0.15,room_id={room_id},sub_room_id=,sub_channel_id=,did_rule=3,user_unique_id={user_unique_id},device_platform=web,device_type=,ac=,identity=audience"
     x_ms_stub = hashlib.md5(raw_string.encode("utf-8")).hexdigest()
-    result = sign_js.call("get_signature", x_ms_stub)
-    return result.get("X-Bogus")
+    
+    # Find dy_live_sign.js path
+    sign_path = path.join(basedir, 'static', 'dy_live_sign.js')
+    if not path.exists(sign_path):
+        sign_path = path.join(basedir, '..', 'static', 'dy_live_sign.js')
+    
+    if not path.exists(sign_path):
+        raise RuntimeError(f"dy_live_sign.js not found at {sign_path}")
+    
+    # Build Node.js script:
+    # 1. Override process.exit to prevent the self-destruct (dy_live_sign.js calls process.exit(-6))
+    # 2. Save original console.log, then silence it during eval (line 7067 test call prints garbage)
+    # 3. Eval the file (defines window.byted_acrawler and get_signature globally)
+    # 4. Restore console.log and call get_signature(x_ms_stub), print JSON result
+    js_code = (
+        "process.exit=function(){};"
+        "var _cl=console.log;console.log=function(){};"
+        "eval(require('fs').readFileSync(" + json.dumps(sign_path) + ",'utf-8'));"
+        "console.log=_cl;"
+        "var r=get_signature(" + json.dumps(x_ms_stub) + ");"
+        "console.log(JSON.stringify(r));"
+    )
+    
+    try:
+        proc = subprocess.run(
+            ['node', '-e', js_code],
+            capture_output=True, text=True, timeout=15, encoding='utf-8'
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("generate_signature: Node.js subprocess timed out (15s)")
+    
+    # Parse JSON output from stdout FIRST — Node.js may exit with code -6 even when stdout
+    # contains a valid result. Same pattern as generate_a_bogus().
+    # Two possible formats observed:
+    #   Format A: {"X-Bogus":"..."} (direct object)
+    #   Format B: ["ok", {"X-Bogus":"..."}] (array returned by get_signature)
+    for line in proc.stdout.strip().split('\n'):
+        line = line.strip()
+        try:
+            obj = json.loads(line)
+            # Format A: direct {"X-Bogus": "..."}
+            if isinstance(obj, dict) and 'X-Bogus' in obj:
+                return obj['X-Bogus']
+            # Format B: ["ok", {"X-Bogus": "..."}]
+            if isinstance(obj, list) and len(obj) >= 2:
+                inner = obj[1]
+                if isinstance(inner, dict) and 'X-Bogus' in inner:
+                    return inner['X-Bogus']
+        except json.JSONDecodeError:
+            continue
+    
+    # Only raise if BOTH returncode != 0 AND stdout parsing failed
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"generate_signature: Node.js exited with code {proc.returncode}: "
+            f"stderr={proc.stderr[:300]} stdout={proc.stdout[:300]}"
+        )
+    
+    raise RuntimeError(f"generate_signature: could not parse result: stdout={proc.stdout[:300]}")
 
 
 # 传递私钥

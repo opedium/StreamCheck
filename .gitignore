@@ -1,0 +1,15 @@
+.env
+*.bak
+*.bak2
+venv/
+node_modules/
+__pycache__/
+*.pyc
+logs/
+live_stats.json
+state.json
+notification_log.json
+wbi_cache.json
+*.tmp
+.env.bak*
+udo *

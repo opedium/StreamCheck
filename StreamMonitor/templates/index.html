@@ -3,385 +3,1184 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>StreamMonitor - 抖音直播监控服务</title>
+    <title>StreamMonitor 直播监控</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js">
+    </script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        /* ============================================================
+           CSS Custom Properties / Design Tokens
+           ============================================================ */
+        :root {
+            --bg-deep: #06060f;
+            --bg-mid: #0c0c20;
+            --bg-card: rgba(255, 255, 255, 0.025);
+            --bg-card-hover: rgba(255, 255, 255, 0.045);
+            --border-subtle: rgba(255, 255, 255, 0.06);
+            --border-card: rgba(255, 255, 255, 0.08);
+            --border-glow: rgba(255, 255, 255, 0.12);
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent-cyan: #22d3ee;
+            --accent-purple: #a78bfa;
+            --accent-pink: #f472b6;
+            --accent-amber: #fbbf24;
+            --accent-green: #10b981;
+            --accent-rose: #fb7185;
+            --accent-blue: #60a5fa;
+            --gradient-hero-1: linear-gradient(135deg, #06b6d4, #3b82f6);
+            --gradient-hero-2: linear-gradient(135deg, #8b5cf6, #d946ef);
+            --gradient-hero-3: linear-gradient(135deg, #f43f5e, #f97316);
+            --gradient-hero-4: linear-gradient(135deg, #10b981, #22d3ee);
+            --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4);
+            --shadow-glow: 0 0 40px rgba(34, 211, 238, 0.08);
+            --radius-lg: 20px;
+            --radius-md: 14px;
+            --radius-sm: 10px;
+            --font-mono: 'SF Mono', 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+        }
+
+        /* ============================================================
+           Reset & Base
+           ============================================================ */
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+                         'Microsoft YaHei', 'Helvetica Neue', sans-serif;
+            background: var(--bg-deep);
+            color: var(--text-primary);
             min-height: 100vh;
-            color: #e0e0e0;
-            padding: 20px;
+            overflow-x: hidden;
+            line-height: 1.5;
         }
-        .header {
-            max-width: 1200px;
-            margin: 0 auto 40px;
-            text-align: center;
+
+        /* ── Animated background blobs ──────────────────────────── */
+        .bg-layer {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
         }
-        .header h1 {
-            font-size: 36px;
-            color: #fff;
-            margin-bottom: 8px;
-        }
-        .header p {
-            color: #a0a0b0;
-            font-size: 16px;
-        }
-        .grid {
-            max-width: 1200px;
-            margin: 0 auto;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 24px;
-            margin-bottom: 40px;
-        }
-        .section {
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(20px);
-            border-radius: 16px;
-            padding: 30px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-        }
-        .section.full {
-            grid-column: 1 / -1;
-        }
-        .section-title {
-            font-size: 18px;
-            font-weight: 600;
-            margin-bottom: 20px;
-            color: #fff;
-            padding-bottom: 12px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-        }
-        .overview {
-            color: #d0d0d0;
-            line-height: 1.8;
-            margin-bottom: 16px;
-        }
-        .feature-list {
-            list-style: none;
-            margin-top: 16px;
-        }
-        .feature-list li {
-            padding: 10px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-            display: flex;
-            align-items: flex-start;
-            gap: 12px;
-        }
-        .feature-list li:last-child {
-            border-bottom: none;
-        }
-        .feature-list li:before {
-            content: "✓";
-            color: #2ed573;
-            font-weight: bold;
-            min-width: 20px;
-        }
-        .status-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
-        }
-        .stat-card {
-            background: rgba(255, 255, 255, 0.03);
-            border-radius: 12px;
-            padding: 16px;
-            border: 1px solid rgba(255, 255, 255, 0.06);
-        }
-        .stat-label {
-            font-size: 12px;
-            color: #888;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 8px;
-        }
-        .stat-value {
-            font-size: 24px;
-            font-weight: 600;
-            color: #2ed573;
-        }
-        .stat-value.orange {
-            color: #ffa502;
-        }
-        .stat-value.normal {
-            color: #fff;
-        }
-        .pulse {
-            width: 10px;
-            height: 10px;
-            background: #2ed573;
+        .bg-blob {
+            position: absolute;
             border-radius: 50%;
-            display: inline-block;
-            margin-right: 8px;
-            animation: pulse 2s infinite;
+            filter: blur(120px);
+            opacity: 0.12;
+            animation: blobDrift 24s ease-in-out infinite;
         }
-        @keyframes pulse {
-            0% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.5; transform: scale(1.2); }
-            100% { opacity: 1; transform: scale(1); }
+        .bg-blob:nth-child(1) {
+            width: 700px; height: 700px;
+            background: radial-gradient(circle, #6366f1, transparent 70%);
+            top: -15%; left: -10%;
+            animation-delay: 0s;
         }
-        .endpoints {
-            margin-top: 20px;
+        .bg-blob:nth-child(2) {
+            width: 600px; height: 600px;
+            background: radial-gradient(circle, #ec4899, transparent 70%);
+            bottom: -10%; right: -8%;
+            animation-delay: -8s;
+            animation-duration: 28s;
         }
-        .endpoint {
+        .bg-blob:nth-child(3) {
+            width: 500px; height: 500px;
+            background: radial-gradient(circle, #06b6d4, transparent 70%);
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            animation-delay: -16s;
+            animation-duration: 20s;
+        }
+        @keyframes blobDrift {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            25% { transform: translate(60px, -40px) scale(1.08); }
+            50% { transform: translate(-30px, 50px) scale(0.94); }
+            75% { transform: translate(-50px, -30px) scale(1.05); }
+        }
+
+        /* ── Subtle grid overlay ────────────────────────────────── */
+        .bg-grid {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 0;
+            background-image:
+                linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+            background-size: 60px 60px;
+            mask-image: radial-gradient(ellipse at 50% 50%, black 30%, transparent 70%);
+            -webkit-mask-image: radial-gradient(ellipse at 50% 50%, black 30%, transparent 70%);
+        }
+
+        /* ============================================================
+           App Container
+           ============================================================ */
+        .app {
+            position: relative;
+            z-index: 1;
+            max-width: 1320px;
+            margin: 0 auto;
+            padding: 24px 24px 100px;
+        }
+
+        /* ============================================================
+           Header
+           ============================================================ */
+        .header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 12px;
-            background: rgba(255, 255, 255, 0.02);
-            border-radius: 8px;
-            margin-bottom: 10px;
-            border: 1px solid rgba(255, 255, 255, 0.04);
+            padding: 20px 28px;
+            margin-bottom: 28px;
+            background: var(--bg-card);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            border: 1px solid var(--border-card);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-card);
         }
-        .endpoint-method {
-            display: inline-block;
-            padding: 3px 12px;
-            border-radius: 6px;
-            font-size: 11px;
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .header-logo {
+            width: 44px; height: 44px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 22px;
+            box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3);
+        }
+        .header-title {
+            font-size: 22px;
             font-weight: 700;
-            margin-right: 12px;
-            background: rgba(46, 213, 115, 0.15);
-            color: #2ed573;
+            letter-spacing: -0.3px;
+            color: #fff;
         }
-        .endpoint-path {
-            font-family: 'Courier New', monospace;
-            color: #c0c0d0;
-            flex: 1;
+        .header-sub {
             font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 400;
+            margin-left: 6px;
         }
-        .endpoint-desc {
-            color: #666;
-            font-size: 12px;
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+        }
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 18px;
+            border-radius: 50px;
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.25);
+        }
+        .live-indicator.offline {
+            background: rgba(251, 191, 36, 0.08);
+            border-color: rgba(251, 191, 36, 0.2);
+        }
+        .live-dot {
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.6);
+            position: relative;
+        }
+        .live-dot::after {
+            content: '';
+            position: absolute;
+            inset: -3px;
+            border-radius: 50%;
+            border: 2px solid var(--accent-green);
+            opacity: 0.5;
+            animation: dotPing 1.8s ease-out infinite;
+        }
+        @keyframes dotPing {
+            0% { transform: scale(1); opacity: 0.6; }
+            100% { transform: scale(2.2); opacity: 0; }
+        }
+        .live-indicator.offline .live-dot {
+            background: var(--accent-amber);
+            box-shadow: 0 0 10px rgba(251, 191, 36, 0.4);
+        }
+        .live-indicator.offline .live-dot::after {
+            border-color: var(--accent-amber);
+            animation: none;
+        }
+        .live-text {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--accent-green);
+            letter-spacing: 0.5px;
+        }
+        .live-indicator.offline .live-text {
+            color: var(--accent-amber);
+        }
+        .current-time {
+            font-size: 15px;
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
+            font-family: var(--font-mono);
+            min-width: 80px;
             text-align: right;
         }
-        .recent-events {
-            max-height: 300px;
-            overflow-y: auto;
-        }
-        .event {
-            padding: 12px;
-            background: rgba(255, 255, 255, 0.02);
-            border-radius: 8px;
-            margin-bottom: 10px;
-            border-left: 3px solid #2ed573;
+        .anchor-name {
             font-size: 13px;
+            color: var(--text-muted);
+            font-weight: 500;
+            max-width: 160px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
-        .event.error {
-            border-left-color: #ff4757;
+
+        /* ============================================================
+           Hero Stats Row
+           ============================================================ */
+        .hero-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 18px;
+            margin-bottom: 18px;
         }
-        .event-time {
-            color: #888;
+        .hero-card {
+            position: relative;
+            padding: 26px 24px 22px;
+            background: var(--bg-card);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border-card);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-card);
+            overflow: hidden;
+            transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+            cursor: default;
+        }
+        .hero-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), var(--shadow-glow);
+            border-color: var(--border-glow);
+        }
+        .hero-card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+        }
+        .hero-card:nth-child(1)::before { background: var(--gradient-hero-1); }
+        .hero-card:nth-child(2)::before { background: var(--gradient-hero-2); }
+        .hero-card:nth-child(3)::before { background: var(--gradient-hero-3); }
+        .hero-card:nth-child(4)::before { background: var(--gradient-hero-4); }
+
+        .hero-card .card-value {
+            font-size: 2.4rem;
+            font-weight: 800;
+            letter-spacing: -1px;
+            line-height: 1.15;
+            margin-bottom: 4px;
+            transition: color 0.3s;
+            font-variant-numeric: tabular-nums;
+        }
+        .hero-card:nth-child(1) .card-value { background: var(--gradient-hero-1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .hero-card:nth-child(2) .card-value { background: var(--gradient-hero-2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .hero-card:nth-child(3) .card-value { background: var(--gradient-hero-3); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .hero-card:nth-child(4) .card-value { background: var(--gradient-hero-4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+
+        .hero-card .card-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            letter-spacing: 0.3px;
+        }
+        .hero-card .card-sub {
             font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 2px;
         }
-        .event-msg {
-            color: #e0e0e0;
-            margin-top: 4px;
+
+        /* ── Pulse ring on value change ─────────────────────────── */
+        .hero-card.pulse-ring .card-value {
+            animation: valueFlash 0.6s ease-out;
         }
-        .footer {
-            max-width: 1200px;
-            margin: 40px auto 0;
-            text-align: center;
+        @keyframes valueFlash {
+            0% { filter: brightness(1.8); }
+            100% { filter: brightness(1); }
+        }
+
+        /* ============================================================
+           Secondary Stats Row
+           ============================================================ */
+        .secondary-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            padding: 18px 20px;
+            background: var(--bg-card);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-md);
+            transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+            cursor: default;
+        }
+        .stat-card:hover {
+            transform: translateY(-2px);
+            border-color: var(--border-glow);
+            background: var(--bg-card-hover);
+        }
+        .stat-card .stat-value {
+            font-size: 1.55rem;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            color: #e2e8f0;
+            font-variant-numeric: tabular-nums;
+        }
+        .stat-card .stat-label {
             font-size: 12px;
-            color: #555;
-            padding-top: 20px;
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            color: var(--text-secondary);
+            font-weight: 500;
+            margin-top: 2px;
         }
-        .loading {
-            color: #888;
-            font-style: italic;
+
+        /* ============================================================
+           Content Grid (Chart + Gifts)
+           ============================================================ */
+        .content-grid {
+            display: grid;
+            grid-template-columns: 1.4fr 1fr;
+            gap: 18px;
+            margin-bottom: 24px;
         }
-        @media (max-width: 768px) {
-            .grid {
-                grid-template-columns: 1fr;
-            }
-            .status-grid {
-                grid-template-columns: 1fr;
-            }
-            .header h1 {
-                font-size: 28px;
-            }
+        .panel {
+            background: var(--bg-card);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border-card);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-card);
+            overflow: hidden;
+        }
+        .panel-body {
+            padding: 16px 22px 22px;
+        }
+        /* ── Chart time-range toggles ─────────────────────────── */
+        .chart-toggles {
+            display: flex;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        .chart-toggles button {
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border-subtle);
+            background: transparent;
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-family: inherit;
+            line-height: 1.4;
+            white-space: nowrap;
+        }
+        .chart-toggles button:hover {
+            border-color: var(--border-glow);
+            color: var(--text-secondary);
+            background: rgba(255,255,255,0.03);
+        }
+        .chart-toggles button.active {
+            background: rgba(34, 211, 238, 0.12);
+            border-color: rgba(34, 211, 238, 0.35);
+            color: var(--accent-cyan);
+        }
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 18px 22px 0;
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+            letter-spacing: 0.2px;
+        }
+        .panel-header .chart-toggles { margin-left: 16px; }
+        .chart-wrap {
+            position: relative;
+            height: 260px;
+        }
+        .chart-wrap canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+
+        /* ── Gifts list ─────────────────────────────────────────── */
+        .gifts-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            max-height: 310px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,0.08) transparent;
+        }
+        .gifts-list::-webkit-scrollbar { width: 4px; }
+        .gifts-list::-webkit-scrollbar-track { background: transparent; }
+        .gifts-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
+
+        .gift-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.018);
+            border-radius: 10px;
+            border: 1px solid var(--border-subtle);
+            transition: background 0.2s, border-color 0.2s;
+            animation: giftSlideIn 0.4s ease-out;
+        }
+        @keyframes giftSlideIn {
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        .gift-item:hover {
+            background: rgba(255, 255, 255, 0.04);
+            border-color: var(--border-glow);
+        }
+        .gift-rank {
+            width: 26px; height: 26px;
+            border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; font-weight: 700;
+            flex-shrink: 0;
+        }
+        .gift-rank.r1 { background: linear-gradient(135deg, #f59e0b, #fbbf24); color: #000; }
+        .gift-rank.r2 { background: linear-gradient(135deg, #94a3b8, #cbd5e1); color: #000; }
+        .gift-rank.r3 { background: linear-gradient(135deg, #cd853f, #d4a574); color: #000; }
+        .gift-rank.rn { background: rgba(255,255,255,0.06); color: var(--text-secondary); }
+        .gift-name {
+            flex: 1;
+            margin-left: 12px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #e2e8f0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .gift-count {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--accent-pink);
+            font-variant-numeric: tabular-nums;
+            flex-shrink: 0;
+            margin-left: 12px;
+        }
+        .gifts-empty {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        /* ============================================================
+           Status Bar (footer)
+           ============================================================ */
+        .status-bar {
+            position: fixed;
+            bottom: 0; left: 0; right: 0;
+            z-index: 10;
+            padding: 12px 28px;
+            background: rgba(6, 6, 15, 0.92);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-top: 1px solid var(--border-subtle);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .status-left, .status-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+        .status-dot {
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .status-dot.ws-ok { background: var(--accent-green); box-shadow: 0 0 6px rgba(16,185,129,0.5); }
+        .status-dot.ws-down { background: var(--accent-rose); box-shadow: 0 0 6px rgba(251,113,133,0.4); }
+        .status-label {
+            font-weight: 500;
+        }
+        .status-value {
+            color: var(--text-secondary);
+            font-family: var(--font-mono);
+        }
+
+        /* ============================================================
+           Offline / Waiting State
+           ============================================================ */
+        .offline-overlay {
+            display: none;
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-muted);
+        }
+        body.is-offline .offline-overlay { display: block; }
+        body.is-offline .hero-stats,
+        body.is-offline .secondary-stats,
+        body.is-offline .content-grid { opacity: 0.35; pointer-events: none; }
+        body.is-offline .live-indicator { /* keep indicator visible */ }
+
+        .offline-icon {
+            font-size: 56px;
+            margin-bottom: 16px;
+            filter: grayscale(0.4);
+            opacity: 0.6;
+        }
+        .offline-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        .offline-sub {
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+
+        /* ── Initial loading animation ──────────────────────────── */
+        .skeleton {
+            background: linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0.03) 75%);
+            background-size: 200% 100%;
+            animation: shimmer 2s infinite;
+            border-radius: 6px;
+        }
+        @keyframes shimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+        .hero-card.loading .card-value {
+            -webkit-text-fill-color: transparent !important;
+            background: linear-gradient(90deg, rgba(255,255,255,0.05) 25%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0.05) 75%) !important;
+            background-size: 200% 100% !important;
+            animation: shimmer 2s infinite !important;
+            background-clip: text !important;
+            -webkit-background-clip: text !important;
+            border-radius: 4px;
+            width: fit-content;
+            min-width: 60px;
+        }
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width: 1100px) {
+            .hero-stats { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 900px) {
+            .secondary-stats { grid-template-columns: repeat(2, 1fr); }
+            .content-grid { grid-template-columns: 1fr; }
+            .header { flex-direction: column; gap: 14px; align-items: flex-start; }
+            .header-right { flex-wrap: wrap; gap: 12px; width: 100%; justify-content: space-between; }
+            .current-time { text-align: left; }
+        }
+        @media (max-width: 560px) {
+            .app { padding: 12px 12px 90px; }
+            .hero-stats { grid-template-columns: 1fr; gap: 10px; }
+            .secondary-stats { grid-template-columns: 1fr 1fr; gap: 10px; }
+            .hero-card .card-value { font-size: 2rem; }
+            .hero-card { padding: 18px 16px 16px; }
+            .header { padding: 14px 16px; }
+            .header-title { font-size: 17px; }
+            .status-bar { flex-direction: column; gap: 8px; padding: 10px 16px; }
+            .status-left, .status-right { flex-wrap: wrap; gap: 12px; }
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🚀 StreamMonitor</h1>
-        <p>抖音直播自动监控 & 微博通知系统</p>
+
+    <!-- ── Animated background ──────────────────────────────────────── -->
+    <div class="bg-layer">
+        <div class="bg-blob"></div>
+        <div class="bg-blob"></div>
+        <div class="bg-blob"></div>
+    </div>
+    <div class="bg-grid"></div>
+
+    <!-- ── App ─────────────────────────────────────────────────────── -->
+    <div class="app">
+
+        <!-- Header -->
+        <header class="header">
+            <div class="header-brand">
+                <div class="header-logo">SM</div>
+                <div>
+                    <span class="header-title">StreamMonitor</span>
+                    <span class="header-sub">直播监控</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <span class="anchor-name" id="anchor-name">—</span>
+                <div class="live-indicator offline" id="live-indicator">
+                    <span class="live-dot"></span>
+                    <span class="live-text" id="live-text">等待开播</span>
+                </div>
+                <div class="current-time" id="current-time">--:--:--</div>
+            </div>
+        </header>
+
+        <!-- Hero Stats -->
+        <section class="hero-stats" id="hero-stats">
+            <div class="hero-card loading" data-key="current_viewers">
+                <div class="card-value" id="val-current_viewers">—</div>
+                <div class="card-label">当前在线</div>
+                <div class="card-sub">实时观众数</div>
+            </div>
+            <div class="hero-card loading" data-key="cumulative_views">
+                <div class="card-value" id="val-cumulative_views">—</div>
+                <div class="card-label">累计观看</div>
+                <div class="card-sub">本场场观</div>
+            </div>
+            <div class="hero-card loading" data-key="total_likes">
+                <div class="card-value" id="val-total_likes">—</div>
+                <div class="card-label">点赞</div>
+                <div class="card-sub">累计点赞数</div>
+            </div>
+            <div class="hero-card loading" data-key="peak_viewers">
+                <div class="card-value" id="val-peak_viewers">—</div>
+                <div class="card-label">最高在线</div>
+                <div class="card-sub">峰值观众数</div>
+            </div>
+        </section>
+
+        <!-- Secondary Stats -->
+        <section class="secondary-stats" id="secondary-stats">
+            <div class="stat-card">
+                <div class="stat-value" id="val-new_follows">—</div>
+                <div class="stat-label">新增粉丝</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="val-fan_club_joins">—</div>
+                <div class="stat-label">新增粉丝团</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="val-light_badges">—</div>
+                <div class="stat-label">点亮灯牌</div>
+            </div>
+            <div class="stat-card" id="duration-card">
+                <div class="stat-value" id="val-duration">—</div>
+                <div class="stat-label">直播时长</div>
+            </div>
+        </section>
+
+        <!-- Content: Chart + Gifts -->
+        <section class="content-grid">
+            <div class="panel">
+                <div class="panel-header">
+                    <span>在线观众趋势</span>
+                    <div class="chart-toggles" id="chart-toggles">
+                        <button data-range="5m">5分钟</button>
+                        <button data-range="10m">10分钟</button>
+                        <button data-range="30m">30分钟</button>
+                        <button data-range="1h">1小时</button>
+                        <button data-range="2h">2小时</button>
+                        <button data-range="all" class="active">全部</button>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div class="chart-wrap">
+                        <canvas id="viewer-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">热门礼物</div>
+                <div class="panel-body">
+                    <div class="gifts-list" id="gifts-list">
+                        <div class="gifts-empty">暂无礼物数据</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Offline overlay -->
+        <div class="offline-overlay" id="offline-overlay">
+            <div class="offline-icon">—</div>
+            <div class="offline-title">等待开播</div>
+            <div class="offline-sub">主播尚未开播，请耐心等待...</div>
+            <div class="offline-sub" style="margin-top:6px;font-size:12px;" id="offline-hint"></div>
+        </div>
+
     </div>
 
-    <div class="grid">
-        <!-- 程序概览 -->
-        <div class="section">
-            <div class="section-title">📋 程序概览</div>
-            <div class="overview">
-                <strong>StreamMonitor</strong> 是一个全自动化的抖音直播监控系统，能够：
-            </div>
-            <ul class="feature-list">
-                <li>持续监控抖音直播间状态</li>
-                <li>直播开启时自动发布微博通知</li>
-                <li>直播结束时发送详细的统计数据</li>
-                <li>记录所有通知历史日志</li>
-                <li>提供 REST API 接口查询状态</li>
-                <li>24/7 不间断运行监控</li>
-            </ul>
+    <!-- Status Bar -->
+    <footer class="status-bar">
+        <div class="status-left">
+            <span class="status-label">StreamMonitor v1.0</span>
+            <span style="opacity:0.4;">|</span>
+            <span class="status-dot ws-down" id="ws-dot"></span>
+            <span id="ws-status">检查中...</span>
         </div>
-
-        <!-- 实时状态 -->
-        <div class="section">
-            <div class="section-title">⚡ 实时状态</div>
-            <div class="status-grid">
-                <div class="stat-card">
-                    <div class="stat-label">服务状态</div>
-                    <div class="stat-value"><span class="pulse"></span>运行中</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">服务运行时长</div>
-                    <div class="stat-value normal" id="uptime">0h</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">监控进程</div>
-                    <div class="stat-value" id="monitor-status">检查中...</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">当前时间</div>
-                    <div class="stat-value normal" id="current-time">--</div>
-                </div>
-            </div>
+        <div class="status-right">
+            <span>上次更新</span>
+            <span class="status-value" id="last-update">—</span>
+            <span style="opacity:0.4;">|</span>
+            <span>自动刷新 5s</span>
         </div>
-
-        <!-- 工作原理 -->
-        <div class="section">
-            <div class="section-title">🔄 工作原理</div>
-            <div class="overview">
-                <strong>三步监控流程：</strong>
-            </div>
-            <ul class="feature-list">
-                <li><strong>检测状态：</strong> 每30秒检查一次直播间状态</li>
-                <li><strong>识别变化：</strong> 检测离线→在线 或 在线→离线</li>
-                <li><strong>发送通知：</strong> 自动发布微博并记录详细日志</li>
-            </ul>
-            <div class="overview" style="margin-top: 16px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
-                <strong>核心功能：</strong>
-                <ul class="feature-list">
-                    <li>使用 Douyin API 实时查询直播状态</li>
-                    <li>通过微博 Cookie 自动发布通知</li>
-                    <li>完整的统计数据（观看数、点赞、粉丝等）</li>
-                </ul>
-            </div>
-        </div>
-
-        <!-- API 接口 -->
-        <div class="section">
-            <div class="section-title">📡 API 接口</div>
-            <div class="endpoints">
-                <div class="endpoint">
-                    <div>
-                        <span class="endpoint-method">GET</span>
-                        <span class="endpoint-path">/</span>
-                    </div>
-                    <div class="endpoint-desc">状态页面</div>
-                </div>
-                <div class="endpoint">
-                    <div>
-                        <span class="endpoint-method">GET</span>
-                        <span class="endpoint-path">/api/health</span>
-                    </div>
-                    <div class="endpoint-desc">健康检查</div>
-                </div>
-                <div class="endpoint">
-                    <div>
-                        <span class="endpoint-method">GET</span>
-                        <span class="endpoint-path">/api/status</span>
-                    </div>
-                    <div class="endpoint-desc">监控状态</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 最近事件 -->
-        <div class="section full">
-            <div class="section-title">📝 最近事件日志</div>
-            <div class="recent-events" id="recent-events">
-                <div class="loading">加载中...</div>
-            </div>
-        </div>
-    </div>
-
-    <div class="footer">
-        StreamMonitor &copy; 2026 &middot; 由 Flask 驱动 &middot; <a href="/api/health" style="color: #2ed573; text-decoration: none;">API 文档</a>
-    </div>
+    </footer>
 
     <script>
-        // 更新当前时间
-        function updateTime() {
+    (function() {
+        /* ============================================================
+           State
+           ============================================================ */
+        const state = {
+            live: false,
+            prevValues: {},       // previous numeric values for animation
+            viewerHistory: [],    // [{t: timestamp, v: viewers}, ...]
+            maxHistoryPoints: 1500, // ~2 hr at 5s intervals
+            chart: null,
+            chartTimeRange: 'all', // '5m' | '10m' | '30m' | '1h' | '2h' | 'all'
+            streamStartTime: null, // ISO string from API, for real-time duration clock
+        };
+
+        const TIME_RANGES = {
+            '5m':  5 * 60 * 1000,
+            '10m': 10 * 60 * 1000,
+            '30m': 30 * 60 * 1000,
+            '1h':  60 * 60 * 1000,
+            '2h':  120 * 60 * 1000,
+            'all': Infinity,
+        };
+
+        /* ============================================================
+           DOM refs
+           ============================================================ */
+        const $ = (sel) => document.querySelector(sel);
+        const $$ = (sel) => document.querySelectorAll(sel);
+
+        const dom = {
+            liveIndicator: $('#live-indicator'),
+            liveText: $('#live-text'),
+            liveDot: $('#live-dot'),
+            currentTime: $('#current-time'),
+            anchorName: $('#anchor-name'),
+            wsDot: $('#ws-dot'),
+            wsStatus: $('#ws-status'),
+            lastUpdate: $('#last-update'),
+            giftsList: $('#gifts-list'),
+            offlineOverlay: $('#offline-overlay'),
+            offlineHint: $('#offline-hint'),
+            body: document.body,
+        };
+
+        /* ============================================================
+           Number formatting
+           ============================================================ */
+        function fmtNum(n) {
+            if (n == null || isNaN(n)) return '—';
+            if (n >= 100000) {
+                return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+            }
+            if (n >= 10000) {
+                return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+            }
+            return n.toLocaleString('zh-CN');
+        }
+
+        function fmtDuration(seconds) {
+            if (seconds == null || seconds < 0) return '—';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+        }
+
+        /* ── Real-time duration clock (ticks every second) ──────── */
+        function updateDuration() {
+            const el = document.getElementById('val-duration');
+            if (!el) return;
+            if (!state.live || !state.streamStartTime) {
+                // Keep whatever is already displayed (frozen on offline, or "—")
+                return;
+            }
             const now = new Date();
-            document.getElementById('current-time').textContent = now.toLocaleTimeString('zh-CN', { hour12: false });
+            const start = new Date(state.streamStartTime);
+            const seconds = Math.floor((now - start) / 1000);
+            el.textContent = fmtDuration(Math.max(0, seconds));
         }
-        updateTime();
-        setInterval(updateTime, 1000);
 
-        // 获取健康状态
-        function updateHealth() {
-            fetch('/api/health')
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('uptime').textContent = data.uptime;
-                })
-                .catch(e => console.error('获取健康状态失败:', e));
+        function fmtTime(isoStr) {
+            if (!isoStr) return '—';
+            try {
+                const d = new Date(isoStr);
+                return d.toLocaleTimeString('zh-CN', { hour12: false });
+            } catch (e) {
+                return '—';
+            }
         }
-        updateHealth();
-        setInterval(updateHealth, 5000);
 
-        // 获取监控状态和事件日志
-        function updateStatus() {
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    // 更新监控进程状态
-                    let monitorStatus = '';
-                    let statusClass = '';
-                    
-                    if (data.monitor.running === true) {
-                        monitorStatus = '✓ 运行中';
-                        statusClass = 'stat-value';
-                    } else if (data.monitor.running === false) {
-                        monitorStatus = '✗ 停止';
-                        statusClass = 'stat-value orange';
-                    } else {
-                        // Running is null/unknown (e.g., on Windows dev environment)
-                        monitorStatus = '⚙ 无法检测';
-                        statusClass = 'stat-value orange';
+        /* ============================================================
+           Animated number counting
+           ============================================================ */
+        function animateValue(el, start, end, duration, formatter) {
+            if (start === end && el.textContent !== '—') {
+                el.textContent = formatter(end);
+                return;
+            }
+            const startTime = performance.now();
+            function tick(now) {
+                const elapsed = now - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+                // easeOutCubic
+                const eased = 1 - Math.pow(1 - progress, 3);
+                const current = Math.round(start + (end - start) * eased);
+                el.textContent = formatter(current);
+                if (progress < 1) {
+                    requestAnimationFrame(tick);
+                } else {
+                    el.textContent = formatter(end);
+                }
+            }
+            requestAnimationFrame(tick);
+        }
+
+        /* ============================================================
+           Pulse effect on card value change
+           ============================================================ */
+        function pulseCard(card) {
+            card.classList.add('pulse-ring');
+            setTimeout(() => card.classList.remove('pulse-ring'), 600);
+        }
+
+        /* ============================================================
+           Chart.js setup
+           ============================================================ */
+        function createChart() {
+            const ctx = $('#viewer-chart').getContext('2d');
+            const gradient = ctx.createLinearGradient(0, 0, 0, 260);
+            gradient.addColorStop(0, 'rgba(34, 211, 238, 0.25)');
+            gradient.addColorStop(0.6, 'rgba(34, 211, 238, 0.04)');
+            gradient.addColorStop(1, 'rgba(34, 211, 238, 0)');
+
+            state.chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: '在线观众',
+                        data: [],
+                        borderColor: '#22d3ee',
+                        backgroundColor: gradient,
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.35,
+                        pointRadius: 0,
+                        pointHoverRadius: 5,
+                        pointHoverBackgroundColor: '#22d3ee',
+                        pointHoverBorderColor: '#fff',
+                        pointHoverBorderWidth: 2,
+                    }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: { duration: 400, easing: 'easeOutQuart' },
+                    interaction: {
+                        intersect: false,
+                        mode: 'index',
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                color: '#475569',
+                                font: { size: 10 },
+                                maxTicksLimit: 8,
+                                callback: function(val, idx) {
+                                    const label = this.getLabelForValue(val);
+                                    if (!label) return '';
+                                    // Show only HH:MM part
+                                    const parts = label.split(':');
+                                    return parts[0] + ':' + parts[1];
+                                },
+                            },
+                            grid: { color: 'rgba(255,255,255,0.04)', drawBorder: false },
+                        },
+                        y: {
+                            ticks: {
+                                color: '#475569',
+                                font: { size: 10 },
+                                maxTicksLimit: 5,
+                                callback: function(v) { return fmtNum(v); },
+                            },
+                            grid: { color: 'rgba(255,255,255,0.04)', drawBorder: false },
+                            beginAtZero: false,
+                        },
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: 'rgba(15, 15, 30, 0.92)',
+                            titleColor: '#94a3b8',
+                            bodyColor: '#f1f5f9',
+                            borderColor: 'rgba(255,255,255,0.1)',
+                            borderWidth: 1,
+                            padding: 12,
+                            cornerRadius: 10,
+                            callbacks: {
+                                label: function(ctx) {
+                                    return '在线: ' + fmtNum(ctx.parsed.y);
+                                },
+                            },
+                        },
+                    },
+                },
+            });
+        }
+
+        function getFilteredHistory() {
+            const rangeMs = TIME_RANGES[state.chartTimeRange] || Infinity;
+            if (rangeMs === Infinity) return state.viewerHistory;
+            const cutoff = new Date() - rangeMs;
+            return state.viewerHistory.filter(function(p) { return p.t >= cutoff; });
+        }
+
+        function renderChart() {
+            if (!state.chart) return;
+            const filtered = getFilteredHistory();
+            state.chart.data.labels = filtered.map(function(p) { return p.label; });
+            state.chart.data.datasets[0].data = filtered.map(function(p) { return p.v; });
+            state.chart.update('none');
+        }
+
+        function updateChart(nowViewers) {
+            if (!state.chart) return;
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('zh-CN', { hour12: false });
+
+            // Avoid duplicate entries at the same second
+            const last = state.viewerHistory[state.viewerHistory.length - 1];
+            if (last && (now - last.t) < 3000) {
+                // Update the last point instead of adding a new one
+                last.v = nowViewers;
+                last.label = timeStr;
+            } else {
+                state.viewerHistory.push({ t: now, v: nowViewers, label: timeStr });
+                if (state.viewerHistory.length > state.maxHistoryPoints) {
+                    state.viewerHistory.shift();
+                }
+            }
+            renderChart();
+        }
+
+        /* ============================================================
+           Update DOM from API data
+           ============================================================ */
+        function updateUI(data) {
+            const isLive = data.live === true;
+            const wasLive = state.live;
+            state.live = isLive;
+
+            // ── Live indicator ─────────────────────────────────
+            if (isLive) {
+                dom.liveIndicator.classList.remove('offline');
+                dom.liveText.textContent = '直播中';
+                dom.body.classList.remove('is-offline');
+            } else {
+                dom.liveIndicator.classList.add('offline');
+                dom.liveText.textContent = '等待开播';
+                dom.body.classList.add('is-offline');
+                // Show hint about last known state or just waiting
+                dom.offlineHint.textContent = wasLive ? '直播已结束' : '数据轮询中...';
+            }
+
+            // ── Anchor name ────────────────────────────────────
+            const nick = data.anchor_nickname || '';
+            dom.anchorName.textContent = nick || '—';
+
+            // ── Helper: update a value with animation ──────────
+            function setVal(id, newVal, formatter, cardSelector) {
+                const el = document.getElementById('val-' + id);
+                if (!el) return;
+                const prev = state.prevValues[id] ?? 0;
+                const num = (newVal != null && !isNaN(newVal)) ? Number(newVal) : 0;
+                const fmt = formatter || fmtNum;
+
+                if (isLive) {
+                    if (num !== prev) {
+                        animateValue(el, prev, num, 700, fmt);
+                        state.prevValues[id] = num;
+                        if (cardSelector) {
+                            const card = document.querySelector(cardSelector);
+                            if (card) pulseCard(card);
+                        }
+                    } else if (el.textContent === '—') {
+                        el.textContent = fmt(num);
+                        state.prevValues[id] = num;
                     }
-                    
-                    const statusEl = document.getElementById('monitor-status');
-                    statusEl.textContent = monitorStatus;
-                    statusEl.className = statusClass;
-
-                    // 更新最近事件
-                    const eventsContainer = document.getElementById('recent-events');
-                    if (data.recent_events && data.recent_events.length > 0) {
-                        eventsContainer.innerHTML = data.recent_events.reverse().map(event => {
-                            const time = new Date(event.timestamp).toLocaleString('zh-CN');
-                            const isError = event.success === false;
-                            return `
-                                <div class="event ${isError ? 'error' : ''}">
-                                    <div class="event-time">${time}</div>
-                                    <div class="event-msg">
-                                        <strong>${event.event}</strong>: ${event.content}
-                                    </div>
-                                </div>
-                            `;
-                        }).join('');
+                } else {
+                    if (wasLive) {
+                        // Stream just ended — show last known values frozen
+                        el.textContent = fmt(num);
                     } else {
-                        eventsContainer.innerHTML = '<div class="loading">暂无事件记录</div>';
+                        el.textContent = '—';
                     }
-                })
-                .catch(e => console.error('获取状态失败:', e));
+                    state.prevValues[id] = num;
+                }
+            }
+
+            // ── Hero stats ─────────────────────────────────────
+            setVal('current_viewers', data.current_viewers, null,
+                   '.hero-card[data-key="current_viewers"]');
+            setVal('cumulative_views', data.cumulative_views, null,
+                   '.hero-card[data-key="cumulative_views"]');
+            setVal('total_likes', data.total_likes, null,
+                   '.hero-card[data-key="total_likes"]');
+            setVal('peak_viewers', data.peak_viewers, null,
+                   '.hero-card[data-key="peak_viewers"]');
+
+            // ── Secondary stats ────────────────────────────────
+            setVal('new_follows', data.new_follows);
+            setVal('fan_club_joins', data.fan_club_joins);
+            setVal('light_badges', data.light_badges);
+            // ── Duration: capture start time for real-time clock ──
+            if (isLive && data.stream_start_time) {
+                state.streamStartTime = data.stream_start_time;
+                updateDuration(); // show immediately, then tick every second
+            } else if (!isLive && wasLive) {
+                // Stream just ended — duration stays frozen at last value
+                updateDuration();
+            } else if (!isLive) {
+                document.getElementById('val-duration').textContent = '—';
+                state.streamStartTime = null;
+            }
+
+            // ── Remove loading class from cards ────────────────
+            if (isLive) {
+                $$('.hero-card.loading').forEach(c => c.classList.remove('loading'));
+            }
+
+            // ── Chart ──────────────────────────────────────────
+            if (isLive && data.current_viewers != null) {
+                updateChart(data.current_viewers);
+            }
+
+            // ── Gifts ──────────────────────────────────────────
+            renderGifts(data.gift_summary || []);
+
+            // ── WS status ──────────────────────────────────────
+            const wsOk = data.ws_connected === true;
+            dom.wsDot.className = 'status-dot ' + (wsOk ? 'ws-ok' : 'ws-down');
+            dom.wsStatus.textContent = wsOk ? 'WebSocket 已连接' : 'WebSocket 未连接';
+
+            // ── Last update time (client-side: when we got the response) ──
+            dom.lastUpdate.textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         }
-        updateStatus();
-        setInterval(updateStatus, 10000);
+
+        /* ============================================================
+           Gifts rendering
+           ============================================================ */
+        function renderGifts(giftSummary) {
+            if (!giftSummary || giftSummary.length === 0) {
+                dom.giftsList.innerHTML = '<div class="gifts-empty">暂无礼物数据</div>';
+                return;
+            }
+            const rankClass = (i) => {
+                if (i === 0) return 'r1';
+                if (i === 1) return 'r2';
+                if (i === 2) return 'r3';
+                return 'rn';
+            };
+            dom.giftsList.innerHTML = giftSummary.map((g, i) => {
+                const name = g[0];
+                const count = g[1];
+                return `
+                    <div class="gift-item" style="animation-delay:${i * 0.05}s">
+                        <div class="gift-rank ${rankClass(i)}">${i + 1}</div>
+                        <span class="gift-name" title="${name}">${name}</span>
+                        <span class="gift-count">×${count}</span>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        /* ============================================================
+           Data fetching
+           ============================================================ */
+        async function fetchLiveStats() {
+            try {
+                const resp = await fetch('/api/live-stats');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                updateUI(data);
+            } catch (err) {
+                console.warn('获取直播数据失败:', err.message);
+                // On fetch failure, don't flip to offline — just show stale data
+                dom.wsDot.className = 'status-dot ws-down';
+                dom.wsStatus.textContent = '连接失败';
+            }
+        }
+
+        /* ============================================================
+           Clock
+           ============================================================ */
+        function updateClock() {
+            const now = new Date();
+            dom.currentTime.textContent = now.toLocaleTimeString('zh-CN', { hour12: false });
+        }
+
+        /* ============================================================
+           Init
+           ============================================================ */
+        function init() {
+            createChart();
+            updateClock();
+            setInterval(function() {
+                updateClock();
+                updateDuration();
+            }, 1000);
+
+            // Chart time-range toggle buttons
+            var toggleContainer = document.getElementById('chart-toggles');
+            if (toggleContainer) {
+                toggleContainer.addEventListener('click', function(e) {
+                    var btn = e.target.closest('button');
+                    if (!btn) return;
+                    var range = btn.getAttribute('data-range');
+                    if (!range || range === state.chartTimeRange) return;
+                    state.chartTimeRange = range;
+                    // Update active button
+                    toggleContainer.querySelectorAll('button').forEach(function(b) { b.classList.remove('active'); });
+                    btn.classList.add('active');
+                    // Re-render chart with new time range
+                    renderChart();
+                });
+            }
+
+            // Fetch immediately, then poll every 5 seconds
+            fetchLiveStats();
+            setInterval(fetchLiveStats, 5000);
+        }
+
+        // Start when DOM is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+    })();
     </script>
 </body>
 </html>

@@ -1,0 +1,5 @@
+.env
+state.json
+notification_log.json
+wbi_cache.json
+__pycache__/

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # coding=utf-8
 """
-StreamMonitor Web Server - Health check and status page.
-Serves an HTML page and JSON API endpoints to verify the service is running.
+StreamMonitor Web Server - Health check, live stats, and status page.
+Serves an HTML page and JSON API endpoints to verify the service is running
+and expose live streaming statistics to a browser dashboard.
 Run on a different port (default 5000) from the main monitor process.
 """
 import os
@@ -23,6 +24,9 @@ APP_START_TIME = time.time()
 
 # ── Flask app ────────────────────────────────────────────────────────
 app = Flask(__name__)
+
+# ── Path to the live stats file written by main.py ───────────────────
+LIVE_STATS_PATH = os.path.join(os.path.dirname(__file__), "live_stats.json")
 
 
 def get_host_ip() -> str:
@@ -54,6 +58,55 @@ def get_uptime() -> str:
     return " ".join(parts)
 
 
+# ── Helper: read live_stats.json ────────────────────────────────────
+
+def read_live_stats() -> dict:
+    """Read live_stats.json written by main.py.
+
+    Returns the full JSON dict if the file exists and is valid.
+    Returns {"live": False} if the file is missing or unparseable,
+    which tells the caller that no stream is currently being tracked.
+    """
+    try:
+        if os.path.isfile(LIVE_STATS_PATH):
+            with open(LIVE_STATS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # Let the caller inspect data.get("live") —
+                # an explicit "live": false means the stream ended,
+                # while a missing file means no tracking is active.
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {"live": False}
+
+
+# ── CORS support ────────────────────────────────────────────────────
+
+@app.before_request
+def handle_preflight():
+    """Respond to browser CORS preflight (OPTIONS) requests globally."""
+    if request.method == "OPTIONS":
+        response = jsonify({"ok": True})
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return response
+
+
+@app.after_request
+def add_cors_headers(response):
+    """Add CORS and cache-control headers to every response."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    # Prevent browser caching so the dashboard always loads fresh JS/HTML
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 # ── Routes ──────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -75,6 +128,35 @@ def api_health():
         "host": get_host_ip(),
         "port": request.host,
     })
+
+
+@app.route("/api/live-stats")
+def api_live_stats():
+    """Return live streaming statistics from live_stats.json.
+
+    When a stream is being monitored, main.py periodically writes a
+    live_stats.json file containing the fields below.  If no stream is
+    active (file absent, empty, or "live": false), the response is
+    simply {"live": false}.
+
+    Fields (when live = true):
+      live_id              - Douyin live room ID (string)
+      anchor_nickname      - Display name of the anchor
+      total_likes          - Cumulative like count this stream
+      new_follows          - New followers gained this stream
+      fan_club_joins       - Fan club joins (delta from start)
+      light_badges         - Light badge events this stream
+      current_viewers      - Most recent concurrent viewer count
+      peak_viewers         - Highest concurrent viewer count
+      cumulative_views     - Total cumulative views
+      gift_summary         - List of {"name": str, "count": int} (top 5)
+      stream_start_time    - ISO-8601 timestamp when recording began
+      stream_duration_seconds - Seconds elapsed since stream_start_time
+      ws_connected         - Whether the WebSocket is still connected
+      member_count         - Max audience member count from protobuf
+      updated_at           - ISO-8601 timestamp of the last file write
+    """
+    return jsonify(read_live_stats())
 
 
 @app.route("/api/status")
@@ -180,12 +262,14 @@ def main():
     host = os.getenv("WEB_HOST", args.host)
     debug = args.debug or os.getenv("WEB_DEBUG", "").lower() in ("1", "true", "yes")
 
-    logger.info("=" * 50)
+    logger.info("=" * 60)
     logger.info("  StreamMonitor Web Server")
     logger.info(f"  Listening on {host}:{port}")
-    logger.info(f"  Health page: http://{host}:{port}/")
-    logger.info(f"  Health API:  http://{host}:{port}/api/health")
-    logger.info("=" * 50)
+    logger.info(f"  Health page:  http://{host}:{port}/")
+    logger.info(f"  Health API:   http://{host}:{port}/api/health")
+    logger.info(f"  Status API:   http://{host}:{port}/api/status")
+    logger.info(f"  Live Stats:   http://{host}:{port}/api/live-stats")
+    logger.info("=" * 60)
 
     app.run(host=host, port=port, debug=debug)
 
