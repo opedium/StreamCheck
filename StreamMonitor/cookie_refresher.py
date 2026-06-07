@@ -145,6 +145,22 @@ class CookieRefresher:
                 )
                 await asyncio.sleep(3)
 
+                # ── Visit live.douyin.com for s_v_web_id ──────────────
+                # s_v_web_id is the device fingerprint cookie used in
+                # every Douyin API call (as the "fp" parameter).  It is
+                # ONLY set by the live.douyin.com subdomain — visiting
+                # www.douyin.com alone will never produce it.
+                print(
+                    "[CookieRefresher] Visiting live.douyin.com "
+                    "for s_v_web_id...",
+                    flush=True,
+                )
+                await page.goto(
+                    "https://live.douyin.com/",
+                    wait_until="networkidle",
+                )
+                await asyncio.sleep(3)
+
                 # ── Extract cookies ────────────────────────────────────
                 page_cookies = await context.cookies()
                 new_cookies = {}
