@@ -43,5 +43,19 @@ module.exports = {
       autorestart: true,
       env: { NODE_ENV: 'production' },
     },
+    {
+      name: 'cookie-refresher',
+      script: '/root/StreamCheck/StreamMonitor/cookie_refresher.py',
+      interpreter: '/root/StreamCheck/venv/bin/python3',
+      cwd: '/root/StreamCheck/StreamMonitor',
+      args: '21600',
+      restart_delay: 60000,
+      max_restarts: 5,
+      error_file: '/root/StreamCheck/logs/cookie-refresher-err.log',
+      out_file: '/root/StreamCheck/logs/cookie-refresher-out.log',
+      merge_logs: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      autorestart: true,
+    },
   ]
 };
