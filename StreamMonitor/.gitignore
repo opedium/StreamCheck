@@ -13,3 +13,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Cookie state (auto-generated, contains secrets)
+cookies.json
+
+# Playwright persistent browser profile (large, auto-generated)
+browser_profile/
+
