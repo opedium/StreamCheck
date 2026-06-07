@@ -110,7 +110,25 @@ Shared cookie file I/O with atomic writes. Single class: `CookieManager`.
 - Monitor reads only, refresher reads-then-writes, no contention
 - No database dependency — just a JSON file on disk
 
-### 2. `cookie_refresher.py` (NEW — ~140 lines)
+### 2. `browser_profile/` (NEW — persistent directory)
+
+**Path:** `StreamMonitor/browser_profile/` (created on first run, gitignored)
+
+A persistent Chromium user data directory. This is the anti-detection foundation — without it, each Playwright launch looks like a brand-new browser, and Douyin's anti-fraud flags the session as hijacked when it sees the same cookies on a different browser fingerprint.
+
+Using a fixed profile means localStorage, Service Workers, and the browser's internal identity (WebGL fingerprint, canvas hash, font metrics) persist across refresh cycles. On the second and subsequent runs, Douyin sees the **same** browser it issued cookies to — just with a different IP, which is normal for mobile users.
+
+**Setup (one-time, on server):**
+```bash
+# Install Chrome (real Chrome, not bundled Chromium) for realistic fingerprint
+playwright install chromium
+playwright install chrome   # channel="chrome" uses this
+
+# Profile directory is created automatically on first run by Playwright
+# using launch_persistent_context()
+```
+
+### 3. `cookie_refresher.py` (NEW — ~160 lines)
 
 Playwright-based refresh logic. Reuses `DouyinAuth` from the existing `Douyin_Spider`.
 
@@ -121,23 +139,34 @@ Playwright-based refresh logic. Reuses `DouyinAuth` from the existing `Douyin_Sp
 Pseudocode:
 ```
 1. Load existing cookies from CookieManager
-2. Launch headless Chromium via Playwright
-3. Create browser context, seed with existing cookies (KEY: this keeps the session alive)
+2. Launch persistent browser context (NOT ephemeral new_context):
+   - launch_persistent_context(user_data_dir="browser_profile/")
+   - Uses channel="chrome" for real Chrome fingerprint
+   - Fixed viewport (1920x1080) and User-Agent
+   - Args: --disable-blink-features=AutomationControlled
+3. Seed existing cookies into context via add_cookies()
+   (persistent context starts with stored cookies from last run,
+   but we also explicitly load from cookies.json for first run + recovery)
 4. Navigate to douyin.com
-5. Wait for page load
-6. Detect dead session: if URL contains "passport" → session expired, return False
-7. Browse discover page for extra cookie churn
-8. Extract all cookies from context
+5. Wait for page load (networkidle)
+6. Detect dead session: if URL redirects to sso.douyin.com or
+   contains "passport" → session expired, return False
+7. Browse discover page + user profile for extra cookie churn
+   (triggers Douyin's sliding session extension)
+8. Extract all cookies from context (including HttpOnly/Secure)
 9. Extract localStorage["security-sdk/s_sdk_crypt_sdk"] for signature keys
 10. Build DouyinAuth with fresh cookies + keys → derives private_key, ticket, etc.
-11. Save to CookieManager
-12. Return True
+11. Save to CookieManager (atomic write)
+12. Do NOT close the persistent context — keeps profile warm for next cycle
+13. Return True
 ```
 
 **Key design choices:**
-- Seeding existing cookies into the browser context is the critical difference from `cookie_util.py` (which starts fresh) — this is what keeps the session alive rather than creating a new one
+- `launch_persistent_context()` instead of `launch()` + `new_context()` — this is the critical anti-detection measure. The profile directory at `browser_profile/` preserves all browser state across runs, making the headless instance appear as a single consistent browser to Douyin
+- `channel="chrome"` uses the real Chrome binary (more realistic fingerprint than Playwright's bundled Chromium)
+- Fixed viewport (`1920x1080`) and UA string persist in the profile — never changes between refreshes
+- Seeding existing cookies from `cookies.json` into the persistent context handles both the first-run case (no cookies in profile yet) and recovery (profile lost/corrupted but cookies.json intact)
 - Dead session detection: if Douyin redirects to `sso.douyin.com` or the URL contains `passport`, the session is gone
-- Chromium args include `--disable-blink-features=AutomationControlled` (already used in `cookie_util.py`)
 - `asyncio.run()` as the bridge between the async Playwright API and the synchronous caller
 
 **Entry point (scheduling loop):**
@@ -158,7 +187,7 @@ async def main():
         await asyncio.sleep(interval)
 ```
 
-### 3. `telegram_notifier.py` (NEW — ~50 lines)
+### 4. `telegram_notifier.py` (NEW — ~50 lines)
 
 Minimal Telegram bot integration for out-of-band alerts.
 
@@ -174,7 +203,7 @@ Minimal Telegram bot integration for out-of-band alerts.
 - Rate limited by state transitions, not time intervals — won't spam
 - 10s timeout on HTTP calls
 
-### 4. StreamMonitor Modifications (`main.py` — ~70 lines added)
+### 5. StreamMonitor Modifications (`main.py` — ~70 lines added)
 
 **Additions to `load_env_config()`:**
 - Read `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` from `.env`
@@ -224,7 +253,7 @@ def _trigger_cookie_refresh(self):
 - Initialize `CookieManager` and `TelegramNotifier`
 - Bootstrap cookies.json from `.env` on first run
 
-### 5. PM2 Configuration Update
+### 6. PM2 Configuration Update
 
 Add the cookie refresher as a separate PM2 process in `ecosystem.config.js`:
 
@@ -244,7 +273,7 @@ Add the cookie refresher as a separate PM2 process in `ecosystem.config.js`:
 }
 ```
 
-### 6. `.env` Changes
+### 7. `.env` Changes
 
 New optional variables:
 ```
@@ -285,15 +314,17 @@ COOKIE_REFRESH_INTERVAL=21600
 | File | Action | Est. Lines |
 |---|---|---|
 | `StreamMonitor/cookie_manager.py` | NEW | ~80 |
-| `StreamMonitor/cookie_refresher.py` | NEW | ~140 |
+| `StreamMonitor/cookie_refresher.py` | NEW | ~160 |
 | `StreamMonitor/telegram_notifier.py` | NEW | ~50 |
+| `StreamMonitor/browser_profile/` | NEW (gitignored) | directory |
 | `StreamMonitor/main.py` | Modify | +~70 |
 | `StreamMonitor/.env.example` | Modify | +~8 |
+| `StreamMonitor/.gitignore` | Modify | +~1 (browser_profile/) |
 | `ecosystem.config.js` | Modify | +~12 |
 
 ## Dependencies
 
 - `playwright` — already in `Douyin_Spider/requirements.txt`
-- Chromium browser — `playwright install chromium` (one-time setup on server)
+- Google Chrome — `playwright install chrome` (one-time setup on server; provides `channel="chrome"` for realistic browser fingerprint)
 - `requests` — already available
 - No new Python packages needed
