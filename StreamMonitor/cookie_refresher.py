@@ -131,9 +131,11 @@ class CookieRefresher:
                     flush=True,
                 )
                 await page.goto(
-                    "https://www.douyin.com/", wait_until="networkidle"
+                    "https://www.douyin.com/", wait_until="domcontentloaded"
                 )
-                await asyncio.sleep(5)
+                # domcontentloaded fires early — give JS time to set
+                # cookies and populate localStorage
+                await asyncio.sleep(8)
 
                 # ── Dead session detection ─────────────────────────────
                 current_url = page.url
@@ -153,7 +155,7 @@ class CookieRefresher:
                 # session extension and may rotate short-lived tokens.
                 await page.goto(
                     "https://www.douyin.com/discover",
-                    wait_until="networkidle",
+                    wait_until="domcontentloaded",
                 )
                 await asyncio.sleep(3)
 
@@ -169,7 +171,7 @@ class CookieRefresher:
                 )
                 await page.goto(
                     "https://live.douyin.com/",
-                    wait_until="networkidle",
+                    wait_until="domcontentloaded",
                 )
                 await asyncio.sleep(3)
 
@@ -195,34 +197,82 @@ class CookieRefresher:
                 except Exception:
                     keys_str = ""
 
-                # ── Rebuild auth via DouyinAuth ────────────────────────
-                # This derives private_key, ticket, ts_sign etc. from
-                # the localStorage keys, which are needed for API calls
-                # that use bd-ticket-guard-* headers.
-                from builder.auth import DouyinAuth
+                # ── Rebuild auth and save ──────────────────────────────
+                # Try DouyinAuth for full derived fields (private_key,
+                # ticket, etc.).  If the import fails (e.g. protobuf
+                # version mismatch), fall back to saving just the raw
+                # cookies from Playwright — they're still valid.
+                saved = False
+                try:
+                    from builder.auth import DouyinAuth
 
-                auth = DouyinAuth()
-                auth.perepare_auth("", "", keys_str)
-                auth.cookie = new_cookies
-                auth.cookie_str = "; ".join(
-                    f"{k}={v}" for k, v in new_cookies.items()
-                )
+                    auth = DouyinAuth()
+                    auth.perepare_auth("", "", keys_str)
+                    auth.cookie = new_cookies
+                    auth.cookie_str = "; ".join(
+                        f"{k}={v}" for k, v in new_cookies.items()
+                    )
 
-                # ── Save ───────────────────────────────────────────────
-                self.manager.save(
-                    {
-                        "cookie_str": auth.cookie_str,
-                        "cookie_dict": new_cookies,
-                        "private_key": auth.private_key or "",
-                        "ticket": auth.ticket or "",
-                        "ts_sign": auth.ts_sign or "",
-                        "client_cert": auth.client_cert or "",
-                        "ree_public_key": auth.ree_public_key or "",
-                        "uid": auth.uid or "",
-                        "health": "ok",
-                        "refresh_count": data.get("refresh_count", 0) + 1,
-                    }
-                )
+                    self.manager.save(
+                        {
+                            "cookie_str": auth.cookie_str,
+                            "cookie_dict": new_cookies,
+                            "private_key": auth.private_key or "",
+                            "ticket": auth.ticket or "",
+                            "ts_sign": auth.ts_sign or "",
+                            "client_cert": auth.client_cert or "",
+                            "ree_public_key": auth.ree_public_key or "",
+                            "uid": auth.uid or "",
+                            "health": "ok",
+                            "refresh_count": data.get("refresh_count", 0)
+                            + 1,
+                        }
+                    )
+                    saved = True
+                except Exception as e:
+                    print(
+                        f"[CookieRefresher] DouyinAuth unavailable "
+                        f"({e}) — saving raw cookies",
+                        flush=True,
+                    )
+
+                if not saved:
+                    # Fallback: save cookies directly from Playwright.
+                    # No derived keys (private_key, ticket, etc.) but
+                    # the cookie string and dict are valid for the
+                    # monitor's immediate needs.
+                    cookie_str = "; ".join(
+                        f"{k}={v}" for k, v in new_cookies.items()
+                    )
+                    # Ensure msToken is present (generate if missing)
+                    if "msToken" not in new_cookies:
+                        import random
+                        import string
+
+                        alphabet = (
+                            string.ascii_letters + string.digits + "-_"
+                        )
+                        ms_token = "".join(
+                            random.choice(alphabet) for _ in range(107)
+                        )
+                        new_cookies["msToken"] = ms_token
+                        cookie_str += f"; msToken={ms_token}"
+
+                    self.manager.save(
+                        {
+                            "cookie_str": cookie_str,
+                            "cookie_dict": new_cookies,
+                            "private_key": data.get("private_key", ""),
+                            "ticket": data.get("ticket", ""),
+                            "ts_sign": data.get("ts_sign", ""),
+                            "client_cert": data.get("client_cert", ""),
+                            "ree_public_key": data.get("ree_public_key", ""),
+                            "uid": data.get("uid", ""),
+                            "health": "ok",
+                            "refresh_count": data.get("refresh_count", 0)
+                            + 1,
+                        }
+                    )
 
                 print(
                     f"[CookieRefresher] Refresh SUCCESS "
