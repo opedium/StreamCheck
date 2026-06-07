@@ -18,6 +18,10 @@ import builtins
 from datetime import datetime
 from urllib.parse import urlencode
 
+# Cookie refresh system
+from cookie_manager import CookieManager
+from telegram_notifier import TelegramNotifier
+
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -92,32 +96,6 @@ STATS_FILE = os.environ.get('STATS_FILE', _STATS_FILE)
 # ======================================================================
 # Formatters for human-readable numbers
 # ======================================================================
-
-# ======================================================================
-# Douyin gift price lookup (diamonds per unit)
-# Auto-loaded from gift_prices.json (fetched from live.douyin.com/webcast/gift/list/)
-# Manual overrides go in GIFT_PRICE_OVERRIDES below.
-# ======================================================================
-_GIFT_PRICES_FILE = os.path.join(os.path.dirname(__file__), 'gift_prices.json')
-try:
-    with open(_GIFT_PRICES_FILE, 'r', encoding='utf-8') as _f:
-        GIFT_PRICES = json.load(_f)
-    logger.info(f"Loaded {len(GIFT_PRICES)} gift prices from {_GIFT_PRICES_FILE}")
-except Exception as _e:
-    logger.warning(f"Failed to load gift prices: {_e}")
-    GIFT_PRICES = {}
-
-# Manual overrides — skin variants whose protobuf diamond_count is the base gift price
-GIFT_PRICE_OVERRIDES = {
-    '至尊超跑': 12000,
-    '烈焰跑车': 6000,
-    '无界超跑': 36000,
-    '青绿典藏版嘉年华': 35000,
-    '钻石嘉年华': 36000,
-    '520嘉年华': 33000,
-}
-for _name, _price in GIFT_PRICE_OVERRIDES.items():
-    GIFT_PRICES[_name] = _price
 
 def fmt_wan(val: float) -> str:
     """Format a number into 万 (10k) unit.
@@ -326,123 +304,6 @@ def parse_fansclub_msg(payload: bytes) -> dict:
     except Exception:
         pass
     return result
-
-
-def dump_all_protobuf_fields(payload: bytes, label: str = "", max_depth: int = 2, _indent: int = 0):
-    """Dump ALL fields from raw protobuf bytes (including unknown/undefined fields).
-    Recurses into sub-messages. Uses print() for guaranteed output."""
-    import struct as _struct
-    prefix = "  " * _indent
-    if _indent == 0:
-        print(f"[PROTO-DUMP] {label}: {len(payload)} bytes", flush=True)
-    offset = 0
-    field_count = 0
-    while offset < len(payload):
-        try:
-            tag, offset = _parse_varint(payload, offset)
-            field_num = tag >> 3
-            wire_type = tag & 0x7
-            if wire_type == 0:  # Varint
-                val, offset = _parse_varint(payload, offset)
-                print(f"{prefix}[{label}] field {field_num} (varint) = {val}", flush=True)
-                field_count += 1
-            elif wire_type == 1:  # 64-bit
-                if offset + 8 <= len(payload):
-                    val = _struct.unpack('<d', payload[offset:offset+8])[0]
-                    print(f"{prefix}[{label}] field {field_num} (64-bit) = {val}", flush=True)
-                offset += 8
-                field_count += 1
-            elif wire_type == 2:  # Length-delimited (string or sub-message)
-                length, offset = _parse_varint(payload, offset)
-                sub = payload[offset:offset + length]
-                offset += length
-                field_count += 1
-                # Always try to decode as string first
-                try:
-                    s = sub.decode('utf-8', errors='replace')
-                    if len(s) < 100:
-                        print(f"{prefix}[{label}] field {field_num} (str) = {s!r}", flush=True)
-                    else:
-                        print(f"{prefix}[{label}] field {field_num} (str, {len(s)}c) = {s[:80]!r}...", flush=True)
-                except Exception:
-                    pass
-                # Recurse into sub-messages for key fields
-                if field_num in (1, 7, 8, 15) and _indent < max_depth:
-                    dump_all_protobuf_fields(sub, f'{label}.f{field_num}', max_depth, _indent + 1)
-            elif wire_type == 5:  # 32-bit
-                if offset + 4 <= len(payload):
-                    val = _struct.unpack('<f', payload[offset:offset+4])[0]
-                    print(f"{prefix}[{label}] field {field_num} (32-bit) = {val}", flush=True)
-                offset += 4
-                field_count += 1
-            else:
-                print(f"{prefix}[{label}] Unknown wire type {wire_type} at offset {offset}", flush=True)
-                break
-        except Exception as e:
-            print(f"{prefix}[{label}] Parse error at offset {offset}: {e}", flush=True)
-            break
-    if _indent == 0:
-        print(f"[PROTO-DUMP] {label}: {field_count} top-level fields", flush=True)
-
-def parse_gift_diamond_count(payload: bytes) -> int:
-    """
-    Parse the raw GiftMessage protobuf bytes to extract diamond_count
-    from the nested GiftStruct (field 15 → field 12).
-
-    GiftMessage schema:
-      field 15: gift (GiftStruct, wire type 2)
-    GiftStruct schema:
-      field 12: diamond_count (uint32, wire type 0)
-
-    Returns the diamond_count (0 if unparseable).
-    """
-    offset = 0
-    try:
-        while offset < len(payload):
-            tag, offset = _parse_varint(payload, offset)
-            field_num = tag >> 3
-            wire_type = tag & 0x7
-
-            if field_num == 15 and wire_type == 2:
-                # gift field — parse its length-delimited content
-                gift_len, offset = _parse_varint(payload, offset)
-                gift_bytes = payload[offset:offset + gift_len]
-                offset += gift_len
-                # Now parse inside the gift bytes for diamond_count (field 12)
-                g_off = 0
-                while g_off < len(gift_bytes):
-                    g_tag, g_off = _parse_varint(gift_bytes, g_off)
-                    g_field = g_tag >> 3
-                    g_wire = g_tag & 0x7
-                    if g_field == 12 and g_wire == 0:
-                        dc, g_off = _parse_varint(gift_bytes, g_off)
-                        return dc
-                    elif g_wire == 0:
-                        _, g_off = _parse_varint(gift_bytes, g_off)
-                    elif g_wire == 1:
-                        g_off += 8
-                    elif g_wire == 2:
-                        length, g_off = _parse_varint(gift_bytes, g_off)
-                        g_off += length
-                    elif g_wire == 5:
-                        g_off += 4
-                    else:
-                        break
-                break  # Only one gift field expected
-            elif wire_type == 0:
-                _, offset = _parse_varint(payload, offset)
-            elif wire_type == 1:
-                offset += 8
-            elif wire_type == 2:
-                length, offset = _parse_varint(payload, offset)
-                offset += length
-            elif wire_type == 5:
-                offset += 4
-            else:
-                break
-    except Exception:
-        pass
-    return 0
 
 
 def parse_gift_dedup_key(payload: bytes) -> tuple:
@@ -966,14 +827,15 @@ class LiveStatsRecorder:
 
     def _on_open(self, ws):
         logger.info(f"[StatsRecorder] WebSocket connected to room {self.live_id}")
+        # Apply seed BEFORE setting stream_start_time so the seed's original
+        # start time (from before a restart) takes precedence over the reconnect time.
+        self._write_live_stats_json()
         # Preserve original start time across reconnects so duration reflects
         # the full broadcast, not just the most recent connection.
         if self.stream_start_time is None:
             self.stream_start_time = datetime.now()
         threading.Thread(target=self._ping, args=(ws,), daemon=True).start()
         threading.Thread(target=self._periodic_summary, args=(ws,), daemon=True).start()
-        # Write initial stats immediately so the dashboard flips to "live" right away
-        self._write_live_stats_json()
         if self.verbose:
             logger.info(f"[StatsRecorder] Started recording at {self.stream_start_time.strftime('%H:%M:%S')}")
 
@@ -1065,6 +927,59 @@ class LiveStatsRecorder:
         from reading a half-written file.
         """
         try:
+            # ── Seed override (safe against repeated application) ──
+            # Seed file persists across process restarts so we can recover
+            # state after a crash.  Every assignment below is idempotent:
+            #   • Cumulative counters use max() → never decrease
+            #   • Baseline values only set when currently 0/unset → never overwrite
+            #   • viewer_samples only appended once (tracked via _seed_samples_applied)
+            _seed_path = os.path.join(os.path.dirname(__file__), 'seed_override.json')
+            if os.path.exists(_seed_path):
+                try:
+                    with open(_seed_path, 'r') as _sf:
+                        _seed = json.load(_sf)
+                    # ── Baseline values: only set when not already present ──
+                    if _seed.get('stream_start_time'):
+                        seed_start = datetime.fromisoformat(_seed['stream_start_time'])
+                        if self.stream_start_time is None or seed_start < self.stream_start_time:
+                            self.stream_start_time = seed_start
+                    # Baseline values: seed is the ground truth — always apply.
+                    # _take_pre_snapshot runs on process restart and fetches the
+                    # CURRENT follower count, NOT the pre-stream baseline.  The
+                    # seed's value is the original pre-stream snapshot and must win.
+                    if _seed.get('follower_before'):
+                        self.follower_before = int(_seed['follower_before'])
+                    if _seed.get('follower_after'):
+                        self.follower_after = int(_seed['follower_after'])
+                    if _seed.get('fan_club_start_count'):
+                        self.fan_club_start_count = int(_seed['fan_club_start_count'])
+                    # ── Cumulative counters: use max() so live events aren't erased ──
+                    if _seed.get('peak_viewers'):
+                        self.peak_viewers = max(self.peak_viewers, int(_seed['peak_viewers']))
+                    if _seed.get('cumulative_views'):
+                        self.cumulative_views = max(self.cumulative_views, int(_seed['cumulative_views']))
+                    if _seed.get('total_likes'):
+                        self.total_likes = max(self.total_likes, int(_seed['total_likes']))
+                    if _seed.get('light_badges'):
+                        self.light_badges = max(self.light_badges, int(_seed['light_badges']))
+                    if _seed.get('fan_club_end_count'):
+                        self.fan_club_end_count = max(self.fan_club_end_count, int(_seed['fan_club_end_count']))
+                    # ── avg_override: only set once ──
+                    if _seed.get('avg_override') and not hasattr(self, '_avg_override'):
+                        self._avg_override = int(_seed['avg_override'])
+                    # ── Viewer samples: only append once ──
+                    if _seed.get('seed_viewer_samples'):
+                        _seed_samples = _seed['seed_viewer_samples']
+                        if isinstance(_seed_samples, list) and _seed_samples:
+                            if not getattr(self, '_seed_samples_applied', False):
+                                self.viewer_samples = list(_seed_samples) + self.viewer_samples
+                                self._last_minute_sample = None
+                                self._seed_samples_applied = True
+                                logger.info(f"[SeedOverride] Seeded {len(_seed_samples)} viewer samples for gap period")
+                    logger.info(f"[SeedOverride] Applied: start={self.stream_start_time}, fb={self.follower_before:,}, fa={self.follower_after:,}, peak={getattr(self,'peak_viewers',0)}, badges={self.light_badges}, fc_start={self.fan_club_start_count}, vsamples={len(self.viewer_samples)}")
+                except Exception as _se:
+                    logger.warning(f"[SeedOverride] Failed: {_se}")
+            # ── End seed override ──────────────────────────────────────────
             if live:
                 # Build gift summary: top 5 real gifts (exclude action gifts)
                 gift_summary = {}
@@ -1094,6 +1009,7 @@ class LiveStatsRecorder:
                     "light_badges": self.light_badges,
                     "current_viewers": self.current_viewers,
                     "peak_viewers": self.peak_viewers,
+                    "average_viewers": sum(self.viewer_samples) // len(self.viewer_samples) if self.viewer_samples else 0,
                     "cumulative_views": self.cumulative_views,
                     "member_count": self.member_count,
                     "stream_start_time": self.stream_start_time.isoformat() if self.stream_start_time else None,
@@ -1132,6 +1048,7 @@ class LiveStatsRecorder:
                     "light_badges": self.light_badges,
                     "current_viewers": self.current_viewers,
                     "peak_viewers": self.peak_viewers,
+                    "average_viewers": sum(self.viewer_samples) // len(self.viewer_samples) if self.viewer_samples else 0,
                     "cumulative_views": self.cumulative_views,
                     "member_count": self.member_count,
                     "stream_start_time": self.stream_start_time.isoformat() if self.stream_start_time else None,
@@ -1211,32 +1128,11 @@ class LiveStatsRecorder:
                     if gid > 0 and not self._should_count_gift(gid, gift_name, uid, rc):
                         continue  # duplicate — skip this gift entirely
                     # ── End gift dedup ─────────────────────────────────────
-                    # Dump raw protobuf to discover hidden price fields
-                    # Log every unique gift name once to find skin variant fields
-                    if not hasattr(self, '_dumped_gifts'):
-                        self._dumped_gifts = set()
-                        logger.info(f"[PROTO-DUMP] Dumper initialized")
-                    if gift_name not in self._dumped_gifts:
-                        self._dumped_gifts.add(gift_name)
-                        logger.info(f"[PROTO-DUMP] Dumping fields for gift: {gift_name} (payload={len(payload)} bytes)")
-                        dump_all_protobuf_fields(payload, f'GiftMessage:{gift_name}')
-                        logger.info(f"[PROTO-DUMP] Done dumping {gift_name}")
-                        if len(self._dumped_gifts) >= 20:
-                            logger.info(f"[PROTO-DUMP] Dumped 20 unique gift types — disabling dumper")
                     self.gift_events.append({
                         'user': msg.user.nickname,
                         'gift': gift_name,
                         'count': combo,
                     })
-                    # Track diamond value — priority chain:
-                    # 1. Manual overrides (skin variants — protobuf returns base price)
-                    # 2. gift_prices.json lookup (API)
-                    # 3. Protobuf diamond_count (last resort, unreliable for skins)
-                    price = GIFT_PRICE_OVERRIDES.get(gift_name, 0)
-                    if price <= 0:
-                        price = GIFT_PRICES.get(gift_name, 0)
-                    if price <= 0:
-                        price = parse_gift_diamond_count(payload)
                     # Gifts that represent badge light-up actions:
                     # "点点星光", "粉丝团灯牌", "闪烁星河"
                     if gift_name in ('点点星光', '粉丝团灯牌', '闪烁星河'):
@@ -1249,8 +1145,7 @@ class LiveStatsRecorder:
                         self.fan_club_gift_joins += combo
                     if self.verbose:
                         join_tag = " [JOIN-CARD]" if ('入团卡' in gift_name or '团卡' in gift_name) else ""
-                        diamond_str = f" 💎{price * combo}" if price > 0 else ""
-                        logger.info(f"[GIFT{join_tag}] {msg.user.nickname} × {gift_name} x{combo}{diamond_str}")
+                        logger.info(f"[GIFT{join_tag}] {msg.user.nickname} × {gift_name} x{combo}")
 
                 elif method == 'WebcastRoomStatsMessage':
                     msg = Live_pb2.RoomStatsMessage()
@@ -1519,19 +1414,18 @@ class LiveStatsRecorder:
     def _get_fan_club_joins(self) -> int:
         """Best estimate of fan club joins during this stream.
 
-        Uses two independent sources, taking the maximum since each can
-        miss some joins under different failure modes:
+        Uses three sources, taking the maximum since each can miss some joins:
 
-        Primary:   fan_club_joins — direct count of type=2 FansclubMessage
-                   events.  Most accurate; each event IS one join.
-        Floor:     fan_club_gift_joins — 入团卡 gift count.  Catches joins
-                   when FansclubMessage protobuf parsing misses events.
-
-        Content-based delta (end_count - start_count) is NOT used because
-        total_members from FansclubMessage is a CHANNEL-LIFETIME cumulative
-        count that crosses stream boundaries and would produce inflated deltas.
+        1. fan_club_joins — direct count of type=2 FansclubMessage events
+        2. fan_club_gift_joins — 入团卡 gift count (fallback when protobuf parsing misses)
+        3. content-based delta (fan_club_end_count - fan_club_start_count)
+           Most reliable when start_count was seeded from the user profile API
+           at stream start.  Survives process restarts via seed_override.json.
         """
-        return max(self.fan_club_joins, self.fan_club_gift_joins)
+        delta = 0
+        if self.fan_club_start_count > 0 and self.fan_club_end_count > 0:
+            delta = max(0, self.fan_club_end_count - self.fan_club_start_count)
+        return max(self.fan_club_joins, self.fan_club_gift_joins, delta)
 
     def _should_count_gift(self, group_id: int, gift_name: str, user_id: int,
                            repeat_count: int) -> bool:
@@ -1686,6 +1580,15 @@ class DouyinLiveChecker:
             url = f"https://live.douyin.com/{self.live_id}"
             try:
                 resp = requests.get(url, headers=self.HEADERS, cookies=self.cookie, verify=False, timeout=15)
+
+                # Detect auth failure before raise_for_status
+                # (redirect to login means cookies are dead)
+                if "passport" in resp.url or "sso.douyin.com" in resp.url:
+                    logger.warning(
+                        f"[Health] Auth redirect detected: {resp.url[:80]}"
+                    )
+                    return {"room_status": "auth_error"}
+
                 resp.raise_for_status()
                 ttwid = ""
                 if 'ttwid' in resp.cookies:
@@ -1910,11 +1813,106 @@ class StreamMonitor:
         self._consecutive_offline_count = 0
         self.CONSECUTIVE_OFFLINE_LIMIT = 2
 
+        # ── Cookie refresh system ─────────────────────────────────────
+        self.cookie_manager = CookieManager()
+        self.notifier = TelegramNotifier()
+        self._cookie_refreshing = False  # guard against concurrent refreshes
+        self._last_auth_error_time = None
+
+        # Bootstrap cookies.json from .env on first run,
+        # then use cookies.json as the authority from now on.
+        self.cookie_manager.bootstrap_from_env()
+        cookie_data = self.cookie_manager.load()
+        # Use cookies.json as cookie source (overrides .env)
+        if cookie_data.get("cookie_str"):
+            self.dy_cookie_str = cookie_data["cookie_str"]
+            # Re-parse into checker
+            self.checker.cookie = DouyinLiveChecker._parse_cookie(
+                self.dy_cookie_str
+            )
+
         # Validate templates at startup
         self._validate_template(self.live_template, self._get_live_template_keys())
         self._validate_template(self.offline_summary_template, self._get_offline_template_keys())
 
         logger.info("StreamMonitor initialised: live.douyin.com/{}", live_id)
+
+    def reload_cookies(self):
+        """Hot-reload cookies from cookies.json into all running components."""
+        data = self.cookie_manager.load()
+        new_cookie_str = data.get("cookie_str", "")
+        if not new_cookie_str:
+            logger.warning(
+                "[CookieReload] cookies.json has empty cookie_str, "
+                "skipping reload"
+            )
+            return False
+        self.dy_cookie_str = new_cookie_str
+        self.checker.cookie = DouyinLiveChecker._parse_cookie(new_cookie_str)
+        if self.stats_recorder and self.stats_recorder.is_running():
+            self.stats_recorder.cookie_str = new_cookie_str
+        logger.info(
+            "[CookieReload] Hot-reloaded cookies into checker and recorder"
+        )
+        return True
+
+    def _trigger_cookie_refresh(self):
+        """Emergency cookie refresh — called when auth failure detected.
+
+        Runs in a background thread to avoid blocking the main loop.
+        """
+        if self._cookie_refreshing:
+            logger.debug(
+                "[CookieRefresh] Refresh already in progress, skipping"
+            )
+            return
+        self._cookie_refreshing = True
+        try:
+            from cookie_refresher import CookieRefresher
+
+            refresher = CookieRefresher(self.cookie_manager)
+            success = asyncio.run(refresher.refresh())
+            if success:
+                self.reload_cookies()
+                self.cookie_manager.mark_healthy()
+                self.notifier.send(
+                    "✅ Emergency cookie refresh succeeded",
+                    state="ok",
+                )
+            else:
+                self.cookie_manager.mark_unhealthy()
+                self.notifier.send(
+                    "\U0001f534 CRITICAL: Emergency cookie refresh "
+                    "FAILED — monitor may be blind. "
+                    "Manual re-login required.",
+                    state="dead",
+                )
+        except Exception as e:
+            logger.error(f"[CookieRefresh] Emergency refresh error: {e}")
+            self.notifier.send(
+                f"❌ Cookie refresh crashed: {e}",
+                state=None,  # force-send on crash
+            )
+        finally:
+            self._cookie_refreshing = False
+
+    def _check_cookie_health(self, room_info):
+        """Check if the HTTP response indicates an auth failure.
+
+        Returns True if cookies appear healthy, False if auth error detected.
+        """
+        status = room_info.get("room_status", "")
+        if status == "auth_error":
+            logger.warning(
+                "[Health] Auth failure detected — "
+                "triggering emergency refresh"
+            )
+            self.cookie_manager.mark_unhealthy()
+            threading.Thread(
+                target=self._trigger_cookie_refresh, daemon=True
+            ).start()
+            return False
+        return True
 
     @staticmethod
     def _get_live_template_keys():
@@ -1950,7 +1948,10 @@ class StreamMonitor:
                 or (fmt_wan(max(r.viewer_samples)) if r.viewer_samples else ""))
 
         # ── avg ──
-        if r.viewer_samples:
+        _avg_ov = getattr(r, '_avg_override', 0)
+        if _avg_ov > 0:
+            avg = fmt_wan(_avg_ov)
+        elif r.viewer_samples:
             avg = fmt_wan(sum(r.viewer_samples) // len(r.viewer_samples))
         elif r.peak_viewers > 0:
             avg = fmt_wan(r.peak_viewers)
@@ -2301,7 +2302,41 @@ class StreamMonitor:
             logger.error(f"Failed to check stream status: {e}")
             return False
 
+        # ── Periodic cookie reload (picks up refreshes from standalone process) ──
+        _reload_every_n = max(1, 300 // self.check_interval)  # ~every 5 min
+        if not hasattr(self, '_cookie_reload_counter'):
+            self._cookie_reload_counter = 0
+        self._cookie_reload_counter += 1
+        if self._cookie_reload_counter >= _reload_every_n:
+            self._cookie_reload_counter = 0
+            data = self.cookie_manager.load()
+            if data.get("cookie_str") and data["cookie_str"] != self.dy_cookie_str:
+                logger.info(
+                    "[CookieReload] Detected updated cookies, hot-reloading..."
+                )
+                self.reload_cookies()
+
         new_status = str(room_info.get('room_status', DouyinLiveChecker.STATUS_OFFLINE))
+
+        # ── Cookie health check ───────────────────────────────────────────
+        if new_status == "auth_error":
+            self._check_cookie_health(room_info)
+            # If we were previously LIVE, preserve state — don't trigger
+            # a false offline event due to auth failure.
+            if self.current_status == DouyinLiveChecker.STATUS_LIVE:
+                print(
+                    f"[{now.strftime('%H:%M:%S')}] ⚠ Auth error but keeping "
+                    f"LIVE state — emergency refresh triggered",
+                    flush=True,
+                )
+                return False
+            else:
+                print(
+                    f"[{now.strftime('%H:%M:%S')}] ⚠ Auth error — "
+                    f"retrying next cycle",
+                    flush=True,
+                )
+                return False
         status_text = "LIVE" if new_status == DouyinLiveChecker.STATUS_LIVE else "OFFLINE"
         title = room_info.get('room_title', '')
         if title:
