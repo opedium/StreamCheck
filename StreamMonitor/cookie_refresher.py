@@ -14,10 +14,22 @@ Usage:
 """
 
 import asyncio
+import builtins
 import os
 import sys
 import traceback
 from datetime import datetime
+
+# ── Python 2 → 3 compatibility for protobuf_to_dict ──────────────────
+# Required BEFORE importing anything from Douyin_Spider, because
+# dy_apis/douyin_api.py imports protobuf_to_dict which references
+# Python 2 builtins (long, unicode, basestring).
+if not hasattr(builtins, 'long'):
+    builtins.long = int
+if not hasattr(builtins, 'unicode'):
+    builtins.unicode = str
+if not hasattr(builtins, 'basestring'):
+    builtins.basestring = str
 
 # ── Ensure StreamMonitor is on sys.path for sibling imports ──────────
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
