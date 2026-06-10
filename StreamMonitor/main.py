@@ -12,10 +12,19 @@ import re
 import time
 import json
 import gzip
+import signal
 import argparse
 import threading
 import builtins
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# Beijing timezone (UTC+8) — used for natural-day boundaries
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _beijing_now() -> datetime:
+    """Return current datetime in Beijing time (UTC+8)."""
+    return datetime.now(_BEIJING_TZ)
 from urllib.parse import urlencode
 
 import requests
@@ -28,9 +37,23 @@ from websocket import WebSocketApp
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def _suppress_stdout():
+    """Temporarily redirect stdout to /dev/null, properly closing the fd."""
+    old_stdout = sys.stdout
+    with open(os.devnull, 'w') as null:
+        sys.stdout = null
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+
 # Force stdout/stderr to be unbuffered so log messages appear immediately
-sys.stdout.reconfigure(line_buffering=True)  # Python 3.7+
-sys.stderr.reconfigure(line_buffering=True)
+sys.stdout.reconfigure(line_buffering=True, encoding='utf-8')  # Python 3.7+
+sys.stderr.reconfigure(line_buffering=True, encoding='utf-8')
 
 
 # ======================================================================
@@ -84,40 +107,33 @@ except Exception as e:
     HAS_LIVE_DETAILS = False
 
 
+def safe_print(*args, **kwargs):
+    """Print that survives closed stdout (e.g., PM2 log rotation).
+
+    When PM2 rotates the log pipe, stdout becomes closed and print()
+    raises ``ValueError: I/O operation on closed file``.  This wrapper
+    swallows that error so the monitor loop never crashes on output.
+    """
+    try:
+        print(*args, **kwargs)
+    except (ValueError, OSError):
+        pass
+
+
 # Stats JSON file path for the web dashboard (configurable via env var)
 _STATS_FILE = os.path.join(os.path.dirname(__file__), 'live_stats.json')
 STATS_FILE = os.environ.get('STATS_FILE', _STATS_FILE)
+
+# CSV time-series files — efficient append-only format for long-term data
+_STATS_CSV_FILE = os.path.join(os.path.dirname(__file__), 'stats_timeseries.csv')
+STATS_CSV_FILE = os.environ.get('STATS_CSV_FILE', _STATS_CSV_FILE)
+_NOTIF_CSV_FILE = os.path.join(os.path.dirname(__file__), 'notification_log.csv')
+NOTIF_CSV_FILE = os.environ.get('NOTIF_CSV_FILE', _NOTIF_CSV_FILE)
 
 
 # ======================================================================
 # Formatters for human-readable numbers
 # ======================================================================
-
-# ======================================================================
-# Douyin gift price lookup (diamonds per unit)
-# Auto-loaded from gift_prices.json (fetched from live.douyin.com/webcast/gift/list/)
-# Manual overrides go in GIFT_PRICE_OVERRIDES below.
-# ======================================================================
-_GIFT_PRICES_FILE = os.path.join(os.path.dirname(__file__), 'gift_prices.json')
-try:
-    with open(_GIFT_PRICES_FILE, 'r', encoding='utf-8') as _f:
-        GIFT_PRICES = json.load(_f)
-    logger.info(f"Loaded {len(GIFT_PRICES)} gift prices from {_GIFT_PRICES_FILE}")
-except Exception as _e:
-    logger.warning(f"Failed to load gift prices: {_e}")
-    GIFT_PRICES = {}
-
-# Manual overrides — skin variants whose protobuf diamond_count is the base gift price
-GIFT_PRICE_OVERRIDES = {
-    '至尊超跑': 12000,
-    '烈焰跑车': 6000,
-    '无界超跑': 36000,
-    '青绿典藏版嘉年华': 35000,
-    '钻石嘉年华': 36000,
-    '520嘉年华': 33000,
-}
-for _name, _price in GIFT_PRICE_OVERRIDES.items():
-    GIFT_PRICES[_name] = _price
 
 def fmt_wan(val: float) -> str:
     """Format a number into 万 (10k) unit.
@@ -296,17 +312,19 @@ def parse_fansclub_msg(payload: bytes) -> dict:
                 content_bytes = payload[offset:offset + length]
                 result['content'] = content_bytes.decode('utf-8', errors='replace')
                 offset += length
-                # Extract total member count from content.
-                # Douyin uses several formats:
+                # Extract total member count from content string.
+                # Douyin formats observed:
                 #   "恭喜 xxx 成为粉丝团第289687名成员"
                 #   "加入了粉丝团，他是第528名成员"
                 #   "xxx 加入粉丝团，当前团成员 12345"
-                #   "恭喜 XY 成为第5667名KOI成员"  (品牌名插入在"名"和"成员"之间)
+                #   "恭喜 XY 成为第5667名KOI成员"
                 for pattern in [
-                    r'第(\d+)名.*成员',
-                    r'第(\d+)位.*成员',
-                    r'团成员\s*(\d+)',
-                    r'(\d+)名.*成员',
+                    r'第\s*(\d+)\s*名',       # 第289687名
+                    r'第\s*(\d+)\s*位',       # 第528位
+                    r'团成员\s*(\d+)',         # 团成员 12345
+                    r'(\d+)\s*名\s*成员',      # 5667名成员 (品牌名 between 名 and 成员)
+                    r'(\d+)\s*位\s*成员',      # 528位成员
+                    r'(\d+)\s*人',             # 12345人
                 ]:
                     m = re.search(pattern, result['content'])
                     if m:
@@ -383,66 +401,6 @@ def dump_all_protobuf_fields(payload: bytes, label: str = "", max_depth: int = 2
             break
     if _indent == 0:
         print(f"[PROTO-DUMP] {label}: {field_count} top-level fields", flush=True)
-
-def parse_gift_diamond_count(payload: bytes) -> int:
-    """
-    Parse the raw GiftMessage protobuf bytes to extract diamond_count
-    from the nested GiftStruct (field 15 → field 12).
-
-    GiftMessage schema:
-      field 15: gift (GiftStruct, wire type 2)
-    GiftStruct schema:
-      field 12: diamond_count (uint32, wire type 0)
-
-    Returns the diamond_count (0 if unparseable).
-    """
-    offset = 0
-    try:
-        while offset < len(payload):
-            tag, offset = _parse_varint(payload, offset)
-            field_num = tag >> 3
-            wire_type = tag & 0x7
-
-            if field_num == 15 and wire_type == 2:
-                # gift field — parse its length-delimited content
-                gift_len, offset = _parse_varint(payload, offset)
-                gift_bytes = payload[offset:offset + gift_len]
-                offset += gift_len
-                # Now parse inside the gift bytes for diamond_count (field 12)
-                g_off = 0
-                while g_off < len(gift_bytes):
-                    g_tag, g_off = _parse_varint(gift_bytes, g_off)
-                    g_field = g_tag >> 3
-                    g_wire = g_tag & 0x7
-                    if g_field == 12 and g_wire == 0:
-                        dc, g_off = _parse_varint(gift_bytes, g_off)
-                        return dc
-                    elif g_wire == 0:
-                        _, g_off = _parse_varint(gift_bytes, g_off)
-                    elif g_wire == 1:
-                        g_off += 8
-                    elif g_wire == 2:
-                        length, g_off = _parse_varint(gift_bytes, g_off)
-                        g_off += length
-                    elif g_wire == 5:
-                        g_off += 4
-                    else:
-                        break
-                break  # Only one gift field expected
-            elif wire_type == 0:
-                _, offset = _parse_varint(payload, offset)
-            elif wire_type == 1:
-                offset += 8
-            elif wire_type == 2:
-                length, offset = _parse_varint(payload, offset)
-                offset += length
-            elif wire_type == 5:
-                offset += 4
-            else:
-                break
-    except Exception:
-        pass
-    return 0
 
 
 def parse_gift_dedup_key(payload: bytes) -> tuple:
@@ -528,15 +486,35 @@ class LiveStatsRecorder:
 
         # counters
         self.total_likes = 0
-        self.new_follows = 0
         self.new_members = 0
         self.member_count = 0          # max memberCount from MemberMessage protobuf
+        self._fresh_member_count = 0  # latest memberCount (resets on reconnect)
         self.light_badges = 0
+        self._light_badge_users = set()  # (user_id, date_str) — one per user per natural day
         self.fan_club_joins = 0        # FansclubMessage type=2 event count
         self.fan_club_gift_joins = 0   # 入团卡 (join-card) gift count
         self.fan_club_start_count = 0  # total members from first fansclub msg
         self.fan_club_end_count = 0    # total members from latest fansclub msg
         self.gift_events = []
+
+        # WS followCount tracking (precise follower delta)
+        # SocialMessage.followCount carries the anchor's absolute follower
+        # count at the time of each follow event.  First-vs-last delta is
+        # immune to API 万-rounding precision loss and to per-event counter
+        # drift (missed events during reconnect).
+        self.ws_follow_first = 0       # first followCount seen this stream
+        self.ws_follow_last = 0        # most recent followCount seen
+        self.ws_follow_last_time = None  # datetime when ws_follow_last VALUE last increased
+        self._ws_restart_count = 0     # how many times WS was restarted for stagnant followCount
+        self._ws_last_restart_time = None  # cooldown: don't restart more than once per 10 min
+
+        # HTTP API follower tracking (authoritative fallback)
+        # When WS followCount stalls (common), the HTTP API
+        # get_user_info().follower_count provides the anchor's true
+        # follower count.  Only precise integer values (not 万-rounded)
+        # are accepted to avoid ±500 rounding error.
+        self.http_follow_first = 0     # first precise HTTP follower count
+        self.http_follow_last = 0      # latest precise HTTP follower count
 
         # Gift dedup: (group_id, gift_name, user_id) → last_repeat_count
         self._gift_dedup = {}
@@ -544,6 +522,7 @@ class LiveStatsRecorder:
 
         # viewer tracking
         self.current_viewers = 0
+        self._last_viewer_update = None  # datetime of last RoomStatsMessage
         self.viewer_samples = []       # per-minute viewer snapshots (at most 1/min)
         self._last_minute_sample = None # throttle RoomStatsMessage sampling to 1/min
         self.peak_viewers = 0
@@ -560,7 +539,7 @@ class LiveStatsRecorder:
         self.stream_start_time = None
         self.stream_end_time = None
         self._stop_event = threading.Event()
-        
+
         # WS disconnection tracking and recovery
         self.ws_disconnected = False
         self.ws_disconnect_time = None
@@ -570,8 +549,165 @@ class LiveStatsRecorder:
         self._last_http_refresh = None         # datetime of last HTTP cumulative refresh
         self._pre_snapshot_done = threading.Event()  # set when _take_pre_snapshot() completes
 
+    def _get_current_viewers(self) -> int:
+        """Current viewer count with staleness fallback.
+
+        If RoomStatsMessage hasn't arrived in >30s, fall back to the
+        latest memberCount (which is equivalent to concurrent viewers
+        on Douyin).
+        """
+        if self._last_viewer_update is None:
+            return getattr(self, '_fresh_member_count', 0)
+        staleness = (datetime.now() - self._last_viewer_update).total_seconds()
+        if staleness > 30:
+            return getattr(self, '_fresh_member_count', self.current_viewers)
+        return max(self.current_viewers, 0)
+
+    @staticmethod
+    def _clear_csv_if_new_stream():
+        """Clear CSV if last row is >2 hours old — this is a new stream,
+        not a crash recovery.  Keeps the file clean across streams."""
+        import csv as _csv
+        try:
+            if not os.path.exists(STATS_CSV_FILE):
+                return
+            with open(STATS_CSV_FILE, 'r', encoding='utf-8', newline='') as _f:
+                reader = list(_csv.DictReader(_f))
+            if not reader:
+                return
+            ts_str = reader[-1].get('timestamp', '')
+            if ts_str:
+                ts = datetime.fromisoformat(ts_str)
+                age_hours = (datetime.now() - ts).total_seconds() / 3600
+                if age_hours > 2:
+                    os.remove(STATS_CSV_FILE)
+                    logger.info(f"[CSV] Cleared old CSV (last row {age_hours:.1f}h ago — new stream)")
+        except Exception:
+            pass
+
+    @classmethod
+    def _recover_from_csv(cls, live_id: str) -> dict:
+        """Recover cumulative stats from the last CSV row after a crash.
+
+        Only recovers if the last row is ≤10 minutes old and matches the
+        given live_id.  Returns a dict of field→value, or {} on miss.
+        """
+        import csv as _csv
+        try:
+            if not os.path.exists(STATS_CSV_FILE):
+                return {}
+            with open(STATS_CSV_FILE, 'r', encoding='utf-8', newline='') as _f:
+                reader = list(_csv.DictReader(_f))
+            if not reader:
+                return {}
+            row = reader[-1]
+            # Only recover if timestamp is recent (≤10 min) and live_id matches
+            ts_str = row.get('timestamp', '')
+            if ts_str:
+                ts = datetime.fromisoformat(ts_str)
+                if (datetime.now() - ts).total_seconds() > 600:
+                    logger.info(f"[CSV Recovery] Last row too old ({ts_str}), skipping")
+                    return {}
+            if row.get('live_id', '') != live_id:
+                return {}
+            recovered = {}
+            # NOTE: total_likes and cumulative_views are NOT recovered.
+            # They are per-stream cumulative values reported by WebSocket
+            # messages (LIKE/ROOMSTATS/USERSEQ).  Recovering yesterday's
+            # all-time totals would block today's lower per-stream values
+            # due to max() semantics in the message handlers.
+            for field in ('peak_viewers', 'follower_before', 'follower_after',
+                          'ws_follow_first', 'ws_follow_last',
+                          'http_follow_first', 'http_follow_last',
+                          'fan_club_start_count', 'fan_club_end_count',
+                          'fan_club_joins', 'fan_club_gift_joins',
+                          'light_badges', 'member_count'):
+                val = row.get(field, '')
+                if val:
+                    recovered[field] = int(val)
+            # Recover light_badge_day as a string (used for daily dedup boundary)
+            _badge_day = row.get('light_badge_day', '')
+            if _badge_day:
+                recovered['light_badge_day'] = _badge_day
+            # Recover top-5 gift names+counts from CSV
+            for rank in (1, 2, 3, 4, 5):
+                g_name = row.get(f'gift_top{rank}_name', '') or ''
+                g_count = row.get(f'gift_top{rank}_count', '') or ''
+                if g_name and g_count:
+                    recovered.setdefault('gift_events', []).append({
+                        'user': '(crash-recovered)',
+                        'gift': g_name,
+                        'count': int(g_count),
+                    })
+            # Recover viewer samples: reconstruct synthetic samples from average
+            # so the overall average is preserved across crashes.
+            _vs_count = int(row.get('viewer_sample_count', 0) or 0)
+            _vs_sum = int(row.get('viewer_sample_sum', 0) or 0)
+            if _vs_count > 0 and _vs_sum > 0:
+                _vs_avg = _vs_sum // _vs_count
+                recovered['viewer_samples'] = [_vs_avg] * _vs_count
+            if row.get('stream_start_time'):
+                recovered['stream_start_time'] = row['stream_start_time']
+            logger.info(f"[CSV Recovery] Recovered {len(recovered)} fields from last CSV row "
+                        f"(ts={ts_str}, live_id={live_id})")
+            return recovered
+        except Exception as e:
+            logger.warning(f"[CSV Recovery] Failed: {e}")
+            return {}
+
     def start_background(self, callback=None):
         self._callback = callback
+        # Clear old CSV data if this is a new stream (last row >2 hours old)
+        self._clear_csv_if_new_stream()
+        # Attempt CSV crash recovery before starting
+        _recovered = self._recover_from_csv(self.live_id)
+        if _recovered:
+            for key, val in _recovered.items():
+                if key == 'stream_start_time':
+                    try:
+                        self.stream_start_time = datetime.fromisoformat(val)
+                    except Exception:
+                        pass
+                elif key == 'viewer_samples':
+                    # Reconstructed synthetic samples — prepend to preserve
+                    # average while allowing new real samples to accumulate
+                    if isinstance(val, list) and val:
+                        self.viewer_samples = list(val)
+                        self._last_minute_sample = None
+                elif key == 'gift_events':
+                    # Reconstructed top-N gifts from CSV — prepend so new
+                    # live events don't overwrite crash-recovered data
+                    if isinstance(val, list) and val:
+                        self.gift_events = list(val) + self.gift_events
+                elif key == 'fan_club_start_count':
+                    # Baseline — only set if not yet captured from live WS.
+                    if self.fan_club_start_count == 0:
+                        self.fan_club_start_count = val
+                elif key in ('follower_before', 'ws_follow_first'):
+                    # Recover these baseline values from CSV for crash recovery
+                    # within the SAME stream.  Cross-stream contamination is
+                    # prevented by the 10-min freshness + live_id match checks above.
+                    # The WS handler's first-event guard (ws_follow_first==0) will
+                    # still fire for truly new streams where no CSV row exists.
+                    if not hasattr(self, key) or getattr(self, key, 0) == 0:
+                        setattr(self, key, val)
+                elif key == 'light_badge_day':
+                    # Restore the badge day so midnight-boundary eviction and
+                    # per-user-per-day dedup work correctly after crash recovery.
+                    # Without this, _light_badge_day resets to '' on restart,
+                    # causing the midnight-eviction block to refilter the
+                    # (empty) dedup set on every badge — harmless, but the
+                    # recovered badge count still works correctly.
+                    self._light_badge_day = str(val)
+                elif hasattr(self, key):
+                    current = getattr(self, key, 0)
+                    setattr(self, key, max(current, val))
+            _vs = len(self.viewer_samples)
+            _avg = sum(self.viewer_samples) // _vs if _vs else 0
+            logger.info(f"[CSV Recovery] Applied recovered stats: "
+                        f"likes={self.total_likes:,}, views={self.cumulative_views:,}, "
+                        f"peak={self.peak_viewers:,}, badges={self.light_badges}, "
+                        f"viewer_samples={_vs} (avg={_avg:,})")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         logger.info(f"LiveStatsRecorder started for live.douyin.com/{self.live_id}")
@@ -608,27 +744,23 @@ class LiveStatsRecorder:
         self._last_recovery_attempt_time = datetime.now()
         
         # Strategy 1: Attempt WS reconnection in a background thread (must NOT block main loop)
+        import random as _random
         logger.warning(f"[WS Recovery] Attempting WebSocket reconnection for room {self.live_id}")
         retry_count = 0
-        max_retries = 2
-        backoff_delay = 3
-        
+        max_retries = 5
+        base_delay = 3
+
         while retry_count < max_retries:
             try:
                 from builder.auth import DouyinAuth  # type: ignore[import-untyped]
                 auth = DouyinAuth()
                 auth.perepare_auth(self.cookie_str, "", "")
-                
-                import sys
-                old_stdout = sys.stdout
-                sys.stdout = open(os.devnull, 'w')
-                try:
+
+                with _suppress_stdout():
                     # Verify live room is still reachable before reconnecting
                     DouyinAPI.get_live_info(auth, self.live_id)
-                finally:
-                    sys.stdout = old_stdout
-                
-                logger.info(f"[WS Recovery] Reconnection attempt {retry_count + 1}: room still reachable, restarting WS in background...")
+
+                logger.info(f"[WS Recovery] Reconnection attempt {retry_count + 1}/{max_retries}: room still reachable, restarting WS in background...")
                 # Reset state so _connect_ws's finally block re-arms correctly
                 self._reconnect_count += 1
                 self._stop_event.clear()
@@ -642,11 +774,14 @@ class LiveStatsRecorder:
             except Exception as e:
                 retry_count += 1
                 if retry_count < max_retries:
-                    logger.warning(f"[WS Recovery] Reconnection attempt {retry_count} failed: {e}. Retrying in {backoff_delay}s...")
-                    time.sleep(backoff_delay)
-                    backoff_delay = int(backoff_delay * 1.5)
+                    # Exponential backoff with jitter: 3s, 6s, 12s, 24s (±20% jitter)
+                    delay = base_delay * (2 ** (retry_count - 1))
+                    jitter = delay * 0.2 * (2 * _random.random() - 1)
+                    delay = max(1, int(delay + jitter))
+                    logger.warning(f"[WS Recovery] Reconnection attempt {retry_count}/{max_retries} failed: {e}. Retrying in {delay}s...")
+                    time.sleep(delay)
                 else:
-                    logger.warning(f"[WS Recovery] WebSocket reconnection failed after {max_retries} attempts")
+                    logger.warning(f"[WS Recovery] WebSocket reconnection failed after {max_retries} attempts (total ~{base_delay * (2**(max_retries-1) - 1)}s window)")
         
         # Strategy 2: Fallback to HTTP to fetch cumulative metrics
         logger.info("[WS Recovery] WebSocket reconnection failed, attempting HTTP fallback for cumulative metrics...")
@@ -669,13 +804,16 @@ class LiveStatsRecorder:
             auth.perepare_auth(self.cookie_str, "", "")
             
             import sys
-            old_stdout = sys.stdout
-            sys.stdout = open(os.devnull, 'w')
-            try:
+            with _suppress_stdout():
                 room_info = DouyinAPI.get_live_info(auth, self.live_id)
-            finally:
-                sys.stdout = old_stdout
-            
+
+            # Fall back to HTTP-parsed room_info when get_live_info fails
+            if room_info is None:
+                room_info = getattr(self, '_http_room_info', None)
+            if room_info is None:
+                logger.error("[HTTP Recovery] No room_info available (get_live_info returned None, no HTTP fallback)")
+                return False
+
             room_id = room_info['room_id']
             user_id = room_info['user_id']
             
@@ -688,20 +826,48 @@ class LiveStatsRecorder:
             sec_uid = room_info.get('sec_uid', '')
             if sec_uid:
                 user_url = f"https://www.douyin.com/user/{sec_uid}"
-                old_stdout = sys.stdout
-                sys.stdout = open(os.devnull, 'w')
-                try:
+                with _suppress_stdout():
                     user_info = DouyinAPI.get_user_info(auth, user_url)
-                finally:
-                    sys.stdout = old_stdout
-                
+
                 user_data = user_info.get('user', {})
                 fc = user_data.get('follower_count', 0)
+                _fc_precision_loss = False
                 if isinstance(fc, str):
-                    fc = float(fc.replace('万', '')) * 10000 if '万' in fc else float(fc)
+                    if '万' in fc:
+                        _fc_precision_loss = True
+                        fc = float(fc.replace('万', '')) * 10000
+                    else:
+                        fc = float(fc)
                 fc_int = int(fc)
-                self.follower_after = fc_int
-                logger.info(f"[HTTP Recovery] Updated follower_after to {self.follower_after:,}")
+                if _fc_precision_loss:
+                    logger.info(
+                        f"[HTTP Recovery] follower_count is 万-rounded "
+                        f"(\"{user_data.get('follower_count')}\") — "
+                        f"precision loss up to ±500"
+                    )
+                else:
+                    # Precise integer — track for HTTP-based follower delta
+                    # On the FIRST refresh of this process, always update
+                    # http_follow_first (overwrites any stale CSV-recovered value).
+                    # On subsequent refreshes, only update if the value drops
+                    # (anchor lost followers — rare but possible).
+                    if not getattr(self, '_http_first_seen', False):
+                        self._http_first_seen = True
+                        self.http_follow_first = fc_int
+                        if self.verbose:
+                            logger.info(f"[HTTP Follow] http_follow_first={fc_int:,} (first this session)")
+                    elif fc_int < self.http_follow_first:
+                        self.http_follow_first = fc_int
+                        if self.verbose:
+                            logger.info(f"[HTTP Follow] http_follow_first reset to {fc_int:,}")
+                    if fc_int > self.http_follow_last:
+                        self.http_follow_last = fc_int
+                        if self.verbose:
+                            logger.info(f"[HTTP Follow] http_follow_last={fc_int:,}")
+                self.follower_after = self.ws_follow_last or self.follower_before
+                logger.info(f"[HTTP Refresh] WS follower={self.ws_follow_last:,}, "
+                            f"API={fc_int:,}, follower_after={self.follower_after:,}, "
+                            f"http_delta={max(0, self.http_follow_last - self.http_follow_first):,}")
             
             if mark_recovery:
                 self.http_cumulative_recovery = True
@@ -735,17 +901,25 @@ class LiveStatsRecorder:
     def _connect_ws(self, auth, cookie_dict):
         try:
             # Suppress stdout from DouyinAPI calls (they may print dicts)
-            import sys
-            old_stdout = sys.stdout
-            sys.stdout = open(os.devnull, 'w')
-            try:
+            with _suppress_stdout():
                 room_info = DouyinAPI.get_live_info(auth, self.live_id)
-            finally:
-                sys.stdout = old_stdout
-            
-            room_id = room_info['room_id']
-            user_id = room_info['user_id']
-            ttwid = room_info['ttwid']
+
+            # Fall back to HTTP-parsed room_info (from check_status via handle_live)
+            # when get_live_info fails — its regex-based parsing is fragile.
+            if room_info is None:
+                room_info = getattr(self, '_http_room_info', None)
+                if room_info:
+                    logger.info("LiveStatsRecorder: using HTTP-parsed room_info as fallback "
+                                f"(room_id={room_info.get('room_id')}, user_id={room_info.get('user_id')})")
+            if room_info is None:
+                logger.error("LiveStatsRecorder: get_live_info returned None and no HTTP fallback available")
+                return
+            room_id = room_info.get('room_id')
+            user_id = room_info.get('user_id')
+            if not room_id or not user_id:
+                logger.error(f"LiveStatsRecorder: incomplete room data: room_id={room_id}, user_id={user_id}")
+                return
+            ttwid = room_info.get('ttwid', '')
             try:
                 # Only take pre-snapshot on initial connect, not on reconnect.
                 # On reconnect, follower_before must keep the original value.
@@ -842,54 +1016,31 @@ class LiveStatsRecorder:
             if sec_uid:
                 user_url = f"https://www.douyin.com/user/{sec_uid}"
                 # Suppress stdout from DouyinAPI (it prints debug dicts)
-                import sys
-                old_stdout = sys.stdout
-                sys.stdout = open(os.devnull, 'w')
-                try:
+                with _suppress_stdout():
                     user_info = DouyinAPI.get_user_info(auth, user_url)
-                finally:
-                    sys.stdout = old_stdout
-                
+
                 user_data = user_info.get('user', {})
                 self.anchor_nickname = user_data.get('nickname', '')
                 fc = user_data.get('follower_count', 0)
+                _fc_precision_loss = False
                 if isinstance(fc, str):
-                    fc = float(fc.replace('万', '')) * 10000 if '万' in fc else float(fc)
-                # Always capture fresh — never use seed data for follower_before.
-                # Each stream start is a new baseline.
-                self.follower_before = int(fc)
-
-                # ── Fan club member count (pre-stream baseline) ──────
-                # Log the API response structure so we can discover the
-                # correct field name for fan club total members.
-                logger.info(
-                    f"[StatsRecorder] user_info top-level keys: "
-                    f"{list(user_info.keys())}"
-                )
-                logger.info(
-                    f"[StatsRecorder] user_data keys: "
-                    f"{list(user_data.keys())}"
-                )
-                # Try common field-name patterns for fan club member count.
-                # Priority: known Douyin API fields → common patterns.
-                club_count = (
-                    user_data.get('fans_club_count')
-                    or user_data.get('fansclub_count')
-                    or user_data.get('fansclub_member_count')
-                    or user_data.get('club_member_count')
-                )
-                # Also check nested structures
-                room_data = user_data.get('room_data', {}) or {}
-                if isinstance(room_data, dict):
-                    club_count = club_count or room_data.get('fansclub_count')
-                if club_count is not None:
-                    club_count = int(club_count)
-                    self.fan_club_start_count = club_count
-                    self.fan_club_end_count = club_count
+                    if '万' in fc:
+                        _fc_precision_loss = True
+                        fc = float(fc.replace('万', '')) * 10000
+                    else:
+                        fc = float(fc)
+                # follower_before is set from the first WS SocialMessage,
+                # not from the 万-rounded API.  Log API value for reference.
+                if _fc_precision_loss:
                     logger.info(
-                        f"[StatsRecorder] Fan club pre-stream count "
-                        f"(from user profile API): {club_count:,}"
+                        f"[StatsRecorder] API follower_count={int(fc):,} "
+                        f"(万-rounded \"{user_data.get('follower_count')}\" — "
+                        f"— precision loss up to ±500)"
                     )
+
+                # Fan club baseline comes exclusively from the first
+                # WebcastFansclubMessage (type=2 join) total_members field.
+                # The HTTP API user_data does not expose this count.
 
                 if self.verbose:
                     logger.info(f"[StatsRecorder] Pre-snapshot: nickname={self.anchor_nickname}, followers={self.follower_before}")
@@ -912,28 +1063,22 @@ class LiveStatsRecorder:
         try:
             # Suppress stdout from DouyinAPI (it prints debug dicts)
             import sys
-            old_stdout = sys.stdout
-            sys.stdout = open(os.devnull, 'w')
-            try:
+            with _suppress_stdout():
                 room_info = DouyinAPI.get_live_info(auth, self.live_id)
-            finally:
-                sys.stdout = old_stdout
 
+            if room_info is None:
+                room_info = getattr(self, '_http_room_info', {})
             sec_uid = room_info.get('sec_uid', '') or fallback_sec_uid
             if sec_uid:
                 user_url = f"https://www.douyin.com/user/{sec_uid}"
-                old_stdout = sys.stdout
-                sys.stdout = open(os.devnull, 'w')
-                try:
+                with _suppress_stdout():
                     user_info = DouyinAPI.get_user_info(auth, user_url)
-                finally:
-                    sys.stdout = old_stdout
 
                 user_data = user_info.get('user', {})
                 fc = user_data.get('follower_count', 0)
                 if isinstance(fc, str):
                     fc = float(fc.replace('万', '')) * 10000 if '万' in fc else float(fc)
-                self.follower_after = int(fc)
+                self.follower_after = self.ws_follow_last or self.follower_before
                 if self.verbose:
                     logger.info(f"[StatsRecorder] Post-snapshot: followers={self.follower_after}, delta={self.follower_after - self.follower_before}")
         except Exception as e:
@@ -948,12 +1093,8 @@ class LiveStatsRecorder:
         try:
             import sys
             user_url = f"https://www.douyin.com/user/{sec_uid}"
-            old_stdout = sys.stdout
-            sys.stdout = open(os.devnull, 'w')
-            try:
+            with _suppress_stdout():
                 user_info = DouyinAPI.get_user_info(auth, user_url)
-            finally:
-                sys.stdout = old_stdout
 
             user_data = user_info.get('user', {})
             fc = user_data.get('follower_count', 0)
@@ -1008,55 +1149,57 @@ class LiveStatsRecorder:
             except Exception:
                 pass
 
-            print(f"\n{'─'*60}")
-            print(f"  📊 直播中概览 (已直播{counter}分钟) - {datetime.now().strftime('%H:%M:%S')}")
-            print(f"{'─'*60}")
-
-            avg_viewers = sum(self.viewer_samples) // len(self.viewer_samples) if self.viewer_samples else 0
-            peak = self.peak_viewers
-            likes = self.total_likes
-            badge = self.light_badges
-            # Use API snapshot delta (follower_after - follower_before)
-            # which captures NET change including non-live-room follows.
-            # follower_after is now periodically refreshed (see above).
-            gifts = len(self.gift_events)
-
-            views_wan = self._try_get_wan('观看')
-            likes_wan = self._try_get_wan('点赞')
-            peak_wan = self._try_get_wan('最高在线')
-            current_online = self.viewer_samples[-1] if self.viewer_samples else 0
-
-            print(f"  👀 当前在线：{fmt_wan(current_online)}人")
-            if self.cumulative_views:
-                print(f"  👁 场观：{fmt_wan(self.cumulative_views)}人")
-            # Prefer total_likes (from LikeMessage.total, real-time cumulative) over displayLong "点赞"
-            print(f"  👍 点赞：{fmt_wan(likes) if likes > 0 else (likes_wan or '?')}")
-            print(f"  🔥 最高在线：{peak_wan or fmt_wan(peak)}")
-            print(f"  📊 平均在线：{fmt_wan(avg_viewers)}")
-            print(f"  📈 新增关注：{self._get_new_follows()}")
-            print(f"  🌟 新增粉丝团：{self._get_fan_club_joins()}人")
-            # Prefer stream-specific light_badge events; show displayLong fallback if WS disconnected
-            if self.light_badges > 0:
-                print(f"  💡 点亮灯牌：{self.light_badges}个 (粉丝团灯牌)")
-            else:
-                badge_wan = self._try_get_wan('灯牌')
-                if badge_wan:
-                    print(f"  💡 点亮灯牌：{badge_wan}个 (频道全天)")
-                else:
-                    print(f"  💡 点亮灯牌：0个")
-            print(f"  🎁 礼物事件：{gifts}")
-            if gifts > 0 and self.gift_events:
-                gift_summary = {}
-                for g in self.gift_events:
-                    name = g['gift']
-                    if self._is_action_gift(name):
-                        continue
-                    gift_summary[name] = gift_summary.get(name, 0) + g['count']
-                top = sorted(gift_summary.items(), key=lambda x: -x[1])[:3]
-                if top:
-                    print(f"  🎀 热门礼物：{' | '.join([f'{n}×{c}' for n,c in top])}")
-            print(f"{'─'*60}\n")
+            # Write CSV/JSON BEFORE printing so crash recovery data is
+            # always persisted even if stdout is disconnected.
             self._write_live_stats_json()
+            self._write_stats_csv()
+
+            try:
+                print(f"\n{'─'*60}")
+                print(f"  📊 直播中概览 (已直播{counter}分钟) - {datetime.now().strftime('%H:%M:%S')}")
+                print(f"{'─'*60}")
+
+                avg_viewers = sum(self.viewer_samples) // len(self.viewer_samples) if self.viewer_samples else 0
+                peak = self.peak_viewers
+                likes = self.total_likes
+                badge = self.light_badges
+                gifts = len(self.gift_events)
+
+                views_wan = self._try_get_wan('观看')
+                likes_wan = self._try_get_wan('点赞')
+                peak_wan = self._try_get_wan('最高在线')
+                current_online = self.viewer_samples[-1] if self.viewer_samples else 0
+
+                print(f"  👀 当前在线：{fmt_wan(current_online)}人")
+                if self.cumulative_views:
+                    print(f"  👁 场观：{fmt_wan(self.cumulative_views)}人")
+                print(f"  👍 点赞：{fmt_wan(likes) if likes > 0 else (likes_wan or '?')}")
+                print(f"  🔥 最高在线：{peak_wan or fmt_wan(peak)}")
+                print(f"  📊 平均在线：{fmt_wan(avg_viewers)}")
+                print(f"  📈 新增关注：{self._get_new_follows()}")
+                print(f"  🌟 新增粉丝团：{self._get_fan_club_joins()}人")
+                if self.light_badges > 0:
+                    print(f"  💡 点亮灯牌：{self.light_badges}个 (粉丝团灯牌)")
+                else:
+                    badge_wan = self._try_get_wan('灯牌')
+                    if badge_wan:
+                        print(f"  💡 点亮灯牌：{badge_wan}个 (频道全天)")
+                    else:
+                        print(f"  💡 点亮灯牌：0个")
+                print(f"  🎁 礼物事件：{gifts}")
+                if gifts > 0 and self.gift_events:
+                    gift_summary = {}
+                    for g in self.gift_events:
+                        name = g['gift']
+                        if self._is_action_gift(name):
+                            continue
+                        gift_summary[name] = gift_summary.get(name, 0) + g['count']
+                    top = sorted(gift_summary.items(), key=lambda x: -x[1])[:3]
+                    if top:
+                        print(f"  🎀 热门礼物：{' | '.join([f'{n}×{c}' for n,c in top])}")
+                print(f"{'─'*60}\n")
+            except Exception:
+                pass  # stdout might be disconnected in background
 
     def _write_live_stats_json(self, live=True):
         """Write current stats to a JSON file for the web dashboard.
@@ -1065,6 +1208,79 @@ class LiveStatsRecorder:
         from reading a half-written file.
         """
         try:
+            # Seed override: recover stats from gap periods after process restart.
+            # seed_override.json persists across restarts; applied ONCE per process
+            # lifetime. Live WS/API values take over after bootstrap.
+            # Cumulative counters use max() so live events are never decreased.
+            import os as _os_seed
+            _seed_path = _os_seed.path.join(_os_seed.path.dirname(__file__), 'seed_override.json')
+            if _os_seed.path.exists(_seed_path):
+                try:
+                    with open(_seed_path, 'r') as _sf:
+                        _seed = json.load(_sf)
+                    # Staleness guard: if the seed's stream_start_time is too old,
+                    # it belongs to a previous stream — delete and ignore it.
+                    # This prevents yesterday's seed from polluting today's new stream.
+                    _MAX_SEED_AGE_HOURS = 6
+                    _seed_stale = False
+                    if _seed.get('stream_start_time'):
+                        try:
+                            _seed_start = datetime.fromisoformat(_seed['stream_start_time'])
+                            _seed_age_hours = (datetime.now() - _seed_start).total_seconds() / 3600
+                            if _seed_age_hours > _MAX_SEED_AGE_HOURS:
+                                _seed_stale = True
+                                logger.warning(
+                                    f'[SeedOverride] Seed is {_seed_age_hours:.1f}h old '
+                                    f'(>{_MAX_SEED_AGE_HOURS}h limit) — discarding stale seed '
+                                    f'from previous stream'
+                                )
+                        except Exception:
+                            pass
+
+                    # One-shot guard: seed applies only on first call, then
+                    # live WS events and periodic HTTP refreshes take over.
+                    if not getattr(self, '_seed_applied', False) and not _seed_stale:
+                        self._seed_applied = True
+                        if _seed.get('stream_start_time'):
+                            seed_start = datetime.fromisoformat(_seed['stream_start_time'])
+                            if self.stream_start_time is None or seed_start < self.stream_start_time:
+                                self.stream_start_time = seed_start
+                        if _seed.get('follower_before'):
+                            self.follower_before = int(_seed['follower_before'])
+                        if _seed.get('follower_after'):
+                            self.follower_after = int(_seed['follower_after'])
+                        if _seed.get('fan_club_start_count'):
+                            self.fan_club_start_count = int(_seed['fan_club_start_count'])
+                        if _seed.get('peak_viewers'):
+                            self.peak_viewers = max(self.peak_viewers, int(_seed['peak_viewers']))
+                        if _seed.get('cumulative_views'):
+                            self.cumulative_views = max(self.cumulative_views, int(_seed['cumulative_views']))
+                        if _seed.get('total_likes'):
+                            self.total_likes = max(self.total_likes, int(_seed['total_likes']))
+                        if _seed.get('light_badges'):
+                            self.light_badges = max(self.light_badges, int(_seed['light_badges']))
+                        if _seed.get('fan_club_end_count'):
+                            self.fan_club_end_count = max(self.fan_club_end_count, int(_seed['fan_club_end_count']))
+                        if _seed.get('fan_club_joins'):
+                            self.fan_club_joins = max(self.fan_club_joins, int(_seed['fan_club_joins']))
+                        if _seed.get('avg_override') and not hasattr(self, '_avg_override'):
+                            self._avg_override = int(_seed['avg_override'])
+                        if _seed.get('seed_viewer_samples'):
+                            _seed_samples = _seed['seed_viewer_samples']
+                            if isinstance(_seed_samples, list) and _seed_samples:
+                                if not getattr(self, '_seed_samples_applied', False):
+                                    self.viewer_samples = list(_seed_samples) + self.viewer_samples
+                                    self._last_minute_sample = None
+                                    self._seed_samples_applied = True
+                                    logger.info('[SeedOverride] Seeded ' + str(len(_seed_samples)) + ' viewer samples for gap period')
+                        _os_seed.remove(_seed_path)
+                        logger.info('[SeedOverride] Applied: start=' + str(self.stream_start_time) + ', fb=' + str(self.follower_before) + ', fa=' + str(self.follower_after) + ', peak=' + str(getattr(self,'peak_viewers',0)) + ', badges=' + str(self.light_badges) + ', fc_start=' + str(self.fan_club_start_count) + ', vsamples=' + str(len(self.viewer_samples)))
+                    else:
+                        # Seed already applied this session. Delete the file
+                        # so it doesn't keep triggering reads (harmless but wasteful).
+                        _os_seed.remove(_seed_path)
+                except Exception as _se:
+                    logger.warning('[SeedOverride] Failed: ' + str(_se))
             if live:
                 # Build gift summary: top 5 real gifts (exclude action gifts)
                 gift_summary = {}
@@ -1092,7 +1308,7 @@ class LiveStatsRecorder:
                     "fan_club_event_joins": self.fan_club_joins,
                     "fan_club_gift_joins": self.fan_club_gift_joins,
                     "light_badges": self.light_badges,
-                    "current_viewers": self.current_viewers,
+                    "current_viewers": self._get_current_viewers(),
                     "peak_viewers": self.peak_viewers,
                     "cumulative_views": self.cumulative_views,
                     "member_count": self.member_count,
@@ -1130,7 +1346,7 @@ class LiveStatsRecorder:
                     "fan_club_event_joins": self.fan_club_joins,
                     "fan_club_gift_joins": self.fan_club_gift_joins,
                     "light_badges": self.light_badges,
-                    "current_viewers": self.current_viewers,
+                    "current_viewers": self._get_current_viewers(),
                     "peak_viewers": self.peak_viewers,
                     "cumulative_views": self.cumulative_views,
                     "member_count": self.member_count,
@@ -1147,6 +1363,103 @@ class LiveStatsRecorder:
             os.replace(tmp_path, STATS_FILE)
         except Exception as e:
             logger.debug(f"[StatsRecorder] Failed to write stats JSON: {e}")
+
+    def _write_stats_csv(self):
+        """Append one row to the CSV time-series file.
+
+        Called every 60s from _periodic_summary().  Uses atomic append
+        (write temp + rename) so the web dashboard can safely tail the file.
+        Writes a header row if the file doesn't exist yet.
+        """
+        import csv as _csv
+        import os as _os_csv
+        try:
+            _exists = _os_csv.path.exists(STATS_CSV_FILE)
+            _tmp = STATS_CSV_FILE + '.tmp'
+
+            _expected_header = (
+                'timestamp,live_id,anchor_nickname,'
+                'current_viewers,peak_viewers,cumulative_views,'
+                'total_likes,follower_before,follower_after,'
+                'follower_delta,ws_follow_first,ws_follow_last,'
+                'http_follow_first,http_follow_last,'
+                'fan_club_start_count,fan_club_end_count,fan_club_joins,'
+                'fan_club_gift_joins,light_badges,light_badge_day,'
+                'gift_event_count,'
+                'gift_top1_name,gift_top1_count,'
+                'gift_top2_name,gift_top2_count,'
+                'gift_top3_name,gift_top3_count,'
+                'gift_top4_name,gift_top4_count,'
+                'gift_top5_name,gift_top5_count,'
+                'ws_connected,'
+                'stream_duration_s,stream_start_time,member_count,'
+                'viewer_sample_count,viewer_sample_sum'
+            )
+
+            # If file exists, copy to temp then append; if header is stale
+            # (format changed), rewrite with new header and all data rows.
+            if _exists:
+                with open(STATS_CSV_FILE, 'r', encoding='utf-8', newline='') as _rf:
+                    _first_line = _rf.readline().rstrip('\r\n')
+                    _rest = _rf.read()
+                with open(_tmp, 'w', encoding='utf-8', newline='') as _wf:
+                    if _first_line != _expected_header:
+                        # Header format changed — rewrite with new header
+                        # followed by existing data rows (skip the old header)
+                        _wf.write(_expected_header + '\n')
+                        _wf.write(_rest)
+                        logger.info("[CSV] Migrated header to new format "
+                                    f"({len(_expected_header.split(','))} columns)")
+                    else:
+                        _wf.write(_first_line + '\n')
+                        _wf.write(_rest)
+            else:
+                # Ensure empty temp file
+                open(_tmp, 'w').close()
+
+            with open(_tmp, 'a', encoding='utf-8', newline='') as _af:
+                _writer = _csv.writer(_af)
+                if not _exists:
+                    _writer.writerow(_expected_header.split(','))
+                _duration = 0
+                if self.stream_start_time:
+                    _duration = int(
+                        (datetime.now() - self.stream_start_time).total_seconds()
+                    )
+                _writer.writerow([
+                    datetime.now().isoformat(),
+                    self.live_id,
+                    self.anchor_nickname,
+                    self._get_current_viewers(),
+                    self.peak_viewers,
+                    self.cumulative_views,
+                    self.total_likes,
+                    self.follower_before,
+                    self.follower_after,
+                    self._get_new_follows(),
+                    self.ws_follow_first,
+                    self.ws_follow_last,
+                    self.http_follow_first,
+                    self.http_follow_last,
+                    self.fan_club_start_count,
+                    self.fan_club_end_count,
+                    self.fan_club_joins,
+                    self.fan_club_gift_joins,
+                    self.light_badges,
+                    getattr(self, '_light_badge_day', ''),
+                    len(self.gift_events),
+                    # Top 5 gifts by count (excluding action gifts)
+                    *self._gift_top5_csv(),
+                    0 if self.ws_disconnected else 1,
+                    _duration,
+                    self.stream_start_time.isoformat() if self.stream_start_time else '',
+                    self.member_count,
+                    len(self.viewer_samples),
+                    sum(self.viewer_samples),
+                ])
+            _os_csv.replace(_tmp, STATS_CSV_FILE)
+        except Exception as _e:
+            logger.debug(f"[StatsRecorder] Failed to write stats CSV: {_e}")
 
     def _on_message(self, ws, message):
         try:
@@ -1178,9 +1491,50 @@ class LiveStatsRecorder:
                     msg = Live_pb2.SocialMessage()
                     msg.ParseFromString(payload)
                     if msg.action == 1:
-                        self.new_follows += 1
+                        # Track absolute follower count from WebSocket payload.
+                        # This is the anchor's precise total at the moment of
+                        # this follow event — far more accurate than the API's
+                        # 万-rounded follower_count field.
+                        fc = msg.followCount
+                        if fc > 0:
+                            # ── WS session reset detection ─────────────────────
+                            # After a crash recovery, ws_follow_first may carry a
+                            # value from the OLD WebSocket session.  If the new
+                            # session's followCount values are ALL lower than the
+                            # recovered ws_follow_first, the WS session was reset
+                            # and old values don't carry over.  Reset to 0 so
+                            # http_delta covers the gap until WS followCount
+                            # starts updating again in this session.
+                            if self.ws_follow_first > 0 and fc < self.ws_follow_first:
+                                if self.verbose:
+                                    logger.info(
+                                        f"[FOLLOW] WS session reset detected: "
+                                        f"old_first={self.ws_follow_first:,}, "
+                                        f"new_fc={fc:,} — resetting WS counters"
+                                    )
+                                self.ws_follow_first = 0
+                                self.ws_follow_last = 0
+                            # ── End reset detection ────────────────────────────
+                            if self.ws_follow_first == 0:
+                                self.ws_follow_first = fc
+                                # Only set follower_before from WS if it wasn't
+                                # already set by seed_override or CSV recovery.
+                                # This preserves manual corrections across restarts.
+                                if self.follower_before == 0:
+                                    self.follower_before = fc
+                                if self.verbose:
+                                    logger.info(f"[FOLLOW] ws_follow_first={fc:,} (follower_before preserved as {self.follower_before:,})")
+                            if fc > self.ws_follow_last:
+                                self.ws_follow_last = fc
+                                self.ws_follow_last_time = datetime.now()
+                                    # ws_follow_last_time only updates when the
+                                    # VALUE changes, not when a message arrives.
+                                    # This prevents "message spam with same value"
+                                    # from masking a truly stalled followCount.
                         if self.verbose:
-                            logger.info(f"[FOLLOW] user={msg.user.nickname}, followCount={msg.followCount}, total={self.new_follows}")
+                            logger.info(f"[FOLLOW] user={msg.user.nickname}, "
+                                        f"followCount={fc:,}, "
+                                        f"ws_delta={self.ws_follow_last - self.ws_follow_first}")
 
                 elif method == 'WebcastMemberMessage':
                     msg = Live_pb2.MemberMessage()
@@ -1190,6 +1544,8 @@ class LiveStatsRecorder:
                     # audience member count (room joins), used as "新增成员" in summaries.
                     if msg.memberCount > self.member_count:
                         self.member_count = msg.memberCount
+                    # Always update fresh count for viewer fallback (no max() barrier)
+                    self._fresh_member_count = max(self._fresh_member_count, msg.memberCount)
                     if self.verbose:
                         logger.info(f"[MEMBER] user={msg.user.nickname}, memberCount={msg.memberCount}, total_events={self.new_members}")
 
@@ -1211,36 +1567,54 @@ class LiveStatsRecorder:
                     if gid > 0 and not self._should_count_gift(gid, gift_name, uid, rc):
                         continue  # duplicate — skip this gift entirely
                     # ── End gift dedup ─────────────────────────────────────
-                    # Dump raw protobuf to discover hidden price fields
-                    # Log every unique gift name once to find skin variant fields
-                    if not hasattr(self, '_dumped_gifts'):
+                    # Protobuf dump: enabled only via env var PROTOBUF_DUMP=1
+                    # Dumps the first 20 unique gift payloads to stdout for debugging
+                    # protobuf field layout.  Disabled by default because each dump
+                    # is 6-17KB of protobuf bytes per gift type.
+                    if (os.environ.get('PROTOBUF_DUMP', '').strip() in ('1', 'true')
+                            and not hasattr(self, '_dumped_gifts')):
                         self._dumped_gifts = set()
-                        logger.info(f"[PROTO-DUMP] Dumper initialized")
-                    if gift_name not in self._dumped_gifts:
-                        self._dumped_gifts.add(gift_name)
-                        logger.info(f"[PROTO-DUMP] Dumping fields for gift: {gift_name} (payload={len(payload)} bytes)")
-                        dump_all_protobuf_fields(payload, f'GiftMessage:{gift_name}')
-                        logger.info(f"[PROTO-DUMP] Done dumping {gift_name}")
-                        if len(self._dumped_gifts) >= 20:
-                            logger.info(f"[PROTO-DUMP] Dumped 20 unique gift types — disabling dumper")
+                        logger.info(f"[PROTO-DUMP] Dumper enabled via PROTOBUF_DUMP=1")
+                    if getattr(self, '_dumped_gifts', None) is not None:
+                        if gift_name not in self._dumped_gifts:
+                            self._dumped_gifts.add(gift_name)
+                            logger.info(f"[PROTO-DUMP] Dumping fields for gift: {gift_name} (payload={len(payload)} bytes)")
+                            dump_all_protobuf_fields(payload, f'GiftMessage:{gift_name}')
+                            logger.info(f"[PROTO-DUMP] Done dumping {gift_name}")
+                            if len(self._dumped_gifts) >= 20:
+                                logger.info(f"[PROTO-DUMP] Dumped 20 unique gift types — disabling dumper")
                     self.gift_events.append({
                         'user': msg.user.nickname,
                         'gift': gift_name,
                         'count': combo,
                     })
-                    # Track diamond value — priority chain:
-                    # 1. Manual overrides (skin variants — protobuf returns base price)
-                    # 2. gift_prices.json lookup (API)
-                    # 3. Protobuf diamond_count (last resort, unreliable for skins)
-                    price = GIFT_PRICE_OVERRIDES.get(gift_name, 0)
-                    if price <= 0:
-                        price = GIFT_PRICES.get(gift_name, 0)
-                    if price <= 0:
-                        price = parse_gift_diamond_count(payload)
-                    # Gifts that represent badge light-up actions:
-                    # "点点星光", "粉丝团灯牌", "闪烁星河"
-                    if gift_name in ('点点星光', '粉丝团灯牌', '闪烁星河'):
-                        self.light_badges += 1
+                    # Cap gift_events at 20,000 to prevent unbounded memory growth
+                    # on long streams.  This discards the oldest entries but
+                    # preserves the summary (top-N) via CSV persistence.
+                    MAX_GIFT_EVENTS = 20000
+                    if len(self.gift_events) > MAX_GIFT_EVENTS:
+                        self.gift_events = self.gift_events[-MAX_GIFT_EVENTS:]
+                    # Gifts that represent badge light-up actions.
+                    # A user can only contribute ONE badge per natural day
+                    # (midnight-to-midnight).  After 12am, the same user
+                    # can contribute another.
+                    if gift_name in ('点点星光', '粉丝团灯牌', '闪烁星河', '点亮粉丝团'):
+                        today = _beijing_now().strftime('%Y%m%d')
+                        # Evict entries from previous days to bound memory
+                        if getattr(self, '_light_badge_day', '') != today:
+                            self._light_badge_users = {
+                                (u, d) for (u, d) in self._light_badge_users
+                                if d == today
+                            }
+                            self._light_badge_day = today
+                        if (uid, today) not in self._light_badge_users:
+                            self._light_badge_users.add((uid, today))
+                            self.light_badges += 1
+                            if self.verbose:
+                                logger.info(f"[BADGE] user_id={uid} — light badge #{self.light_badges} today={today}")
+                        else:
+                            if self.verbose:
+                                logger.info(f"[BADGE] user_id={uid} already counted today — skipping")
                     # Gifts that represent fan club join actions:
                     # "入团卡" (join card) is a reliable fallback when
                     # FansclubMessage protobuf parsing misses events
@@ -1249,14 +1623,14 @@ class LiveStatsRecorder:
                         self.fan_club_gift_joins += combo
                     if self.verbose:
                         join_tag = " [JOIN-CARD]" if ('入团卡' in gift_name or '团卡' in gift_name) else ""
-                        diamond_str = f" 💎{price * combo}" if price > 0 else ""
-                        logger.info(f"[GIFT{join_tag}] {msg.user.nickname} × {gift_name} x{combo}{diamond_str}")
+                        logger.info(f"[GIFT{join_tag}] {msg.user.nickname} × {gift_name} x{combo}")
 
                 elif method == 'WebcastRoomStatsMessage':
                     msg = Live_pb2.RoomStatsMessage()
                     msg.ParseFromString(payload)
                     self.display_long_history.append(msg.displayLong)
                     self.current_viewers = msg.displayValue
+                    self._last_viewer_update = datetime.now()
                     current_viewers = self.current_viewers
                     if current_viewers > self.peak_viewers:
                         self.peak_viewers = current_viewers
@@ -1268,6 +1642,11 @@ class LiveStatsRecorder:
                         (now - self._last_minute_sample).total_seconds() >= 60):
                         self.viewer_samples.append(current_viewers)
                         self._last_minute_sample = now
+                        # Cap viewer_samples at 1,440 (24 hours of 1-min samples)
+                        # to prevent unbounded memory growth on long-running streams.
+                        MAX_VIEWER_SAMPLES = 1440
+                        if len(self.viewer_samples) > MAX_VIEWER_SAMPLES:
+                            self.viewer_samples = self.viewer_samples[-MAX_VIEWER_SAMPLES:]
 
                     # RoomStatsMessage.total may be cumulative views when higher than displayValue
                     if msg.total > current_viewers:
@@ -1294,9 +1673,11 @@ class LiveStatsRecorder:
                         # Store separately so the summary can use it as a fallback only.
 
                 elif method == 'WebcastFansclubMessage':
-                    # FansclubMessage: field 1=Common, field 2=type (1=upgrade, 2=join),
-                    # field 3=content ("恭喜 xxx 成为粉丝团第{N}名成员"), field 4=User.
-                    # Use parse_fansclub_msg() to extract all fields + total_members from content.
+                    # field 2 = type (1=upgrade, 2=join)
+                    # field 3 = content ("恭喜 xxx 成为粉丝团第{N}名成员")
+                    # field 4 = User
+                    # total_members extracted from content via regex in
+                    # parse_fansclub_msg()
                     m = parse_fansclub_msg(payload)
                     if m['type'] == 2:
                         self.fan_club_joins += 1
@@ -1309,7 +1690,7 @@ class LiveStatsRecorder:
                     if m['total_members'] > 0:
                         if self.fan_club_start_count == 0:
                             self.fan_club_start_count = m['total_members']
-                        self.fan_club_end_count = m['total_members']
+                        self.fan_club_end_count = max(self.fan_club_end_count, m['total_members'])
                     elif self.verbose:
                         # Content parsing failed — log the raw content for debugging
                         logger.warning(
@@ -1329,14 +1710,6 @@ class LiveStatsRecorder:
                             f"gift_joins={self.fan_club_gift_joins}"
                         )
 
-                elif method in (
-                    'WebcastLightMessage', 'WebcastFanBadgeMessage',
-                    'WebcastAudienceMessage',
-                ):
-                    # These are badge-related events but we count light badges
-                    # exclusively from the three gifts: 点点星光, 粉丝团灯牌, 闪烁星河
-                    if self.verbose:
-                        logger.info(f"[BADGE/{method}] (not counted toward light_badges)")
 
                 elif method == 'WebcastRoomUserSeqMessage':
                     # Parse RoomUserSeqMessage protobuf to extract totalPvForAnchor (field 11, string)
@@ -1376,7 +1749,6 @@ class LiveStatsRecorder:
             print(f"  [Raw counters]")
             print(f"    total_likes       = {self.total_likes:,}")
             print(f"    cumulative_views  = {self.cumulative_views:,}")
-            print(f"    new_follows       = {self.new_follows}")
             print(f"    follower_before   = {self.follower_before:,}")
             print(f"    follower_after    = {self.follower_after:,}")
             print(f"    new_members       = {self.new_members}")
@@ -1385,7 +1757,7 @@ class LiveStatsRecorder:
             print(f"    fan_club_joins    = {self._get_fan_club_joins()} (events={self.fan_club_joins}, start={self.fan_club_start_count}, end={self.fan_club_end_count})")
             print(f"    peak_viewers      = {self.peak_viewers:,}")
             print(f"    viewer_samples    = {len(self.viewer_samples)}")
-            print(f"    gift_events        = {len(self.gift_events)}")
+            print(f"    gift_events       = {len(self.gift_events):,}")
             print()
 
         avg_viewers = 0
@@ -1423,8 +1795,7 @@ class LiveStatsRecorder:
             else:
                 print(f"👍 本场直播点赞数据：--")
 
-        print(f"📈 本场新增粉丝：{fmt_wan(self._get_new_follows())}人")
-        print(f"（粉丝：{fmt_wan(self.follower_before)} ➡️ {fmt_wan(self.follower_after)}）")
+        print(f"📈 关注涨幅度：{fmt_wan(self.follower_before)} → {fmt_wan(self.follower_after)}（+{fmt_wan(self._get_new_follows())}）")
 
         peak_wan = self._try_get_wan('最高在线')
         if peak_wan:
@@ -1436,11 +1807,13 @@ class LiveStatsRecorder:
 
         print(f"📊 平均在线：{fmt_wan(avg_viewers)}人")
 
-        # Fan club joins: prefer delta from content total-members (end - start);
-        # fallback to type=2 event count; last resort: displayLong "粉丝团".
+        # Fan club joins: content-based delta (end - start) with WS event fallback
         joins = self._get_fan_club_joins()
         if joins > 0:
-            print(f"🌟 今日新增粉丝团：{joins}人")
+            if self.fan_club_start_count > 0 and self.fan_club_end_count > 0:
+                print(f"🌟 新增粉丝团：{fmt_wan(self.fan_club_start_count)} → {fmt_wan(self.fan_club_end_count)}（+{fmt_wan(joins)}）")
+            else:
+                print(f"🌟 新增粉丝团：+{fmt_wan(joins)}人")
         else:
             members_str = self._wan_to_raw_str(self._try_get_wan('粉丝团'))
             if members_str != "0":
@@ -1499,38 +1872,70 @@ class LiveStatsRecorder:
                 return True
         return False
 
-    def _get_new_follows(self) -> int:
-        """Best estimate of new followers during this stream.
+    def _gift_top5_csv(self) -> list:
+        """Return [name1, count1, …, name5, count5] for CSV persistence."""
+        summary = {}
+        for g in self.gift_events:
+            name = g['gift']
+            if self._is_action_gift(name):
+                continue
+            summary[name] = summary.get(name, 0) + g['count']
+        top = sorted(summary.items(), key=lambda x: -x[1])[:5]
+        result = []
+        for name, cnt in top:
+            result.append(name)
+            result.append(str(cnt))
+        # Pad with empty strings if fewer than 5 gift types
+        while len(result) < 10:
+            result.append('')
+        return result
 
-        Primary:  delta = follower_after - follower_before (API snapshots).
-                  Captures NET follower change, including followers gained
-                  from outside the live room (profile, recommendations, etc.).
-        Fallback: new_follows — direct count of WebcastSocialMessage action=1
-                  events received via WebSocket.  Only used when delta = 0
-                  (i.e. follower_after hasn't been refreshed yet).
+    def _ws_follow_stalled(self) -> bool:
+        """Return True if WS followCount hasn't updated in >5 minutes."""
+        if self.ws_follow_last_time is None:
+            return True  # never received a usable followCount
+        staleness = (datetime.now() - self.ws_follow_last_time).total_seconds()
+        return staleness > 300  # 5 min without any followCount update
+
+    def _get_new_follows(self) -> int:
+        """New followers — HTTP API is authoritative baseline, WS supplements in real-time.
+
+        DESIGN (per user spec):
+
+        1. At stream start, HTTP captures follower baseline.
+           Rejects 万-rounded values to avoid ±500 precision loss.
+
+        2. During stream:
+           - WS followCount provides real-time updates when SocialMessage
+             arrives with monotonically-increasing followCount.
+           - HTTP API refreshes every 60s as authoritative baseline.
+           - If WS followCount stalls (>5 min without update), WS delta is
+             dropped and only HTTP is used until WS recovers.
+
+        3. At stream end: caller should use the data source with the newer
+           timestamp (ws_follow_last_time vs _last_http_refresh).
+
+        Returns: max(http_delta, ws_delta_if_not_stalled)
         """
-        delta = self.follower_after - self.follower_before
-        if delta > 0:
-            return delta
-        # delta <= 0 — follower_after not yet refreshed (or unfollows/bot cleanup).
-        # Fall back to the WebSocket event counter.
-        return max(0, self.new_follows)
+        http_delta = max(0, self.http_follow_last - self.http_follow_first)
+        ws_delta = 0
+        if not self._ws_follow_stalled():
+            ws_delta = max(0, self.ws_follow_last - self.ws_follow_first)
+        return max(http_delta, ws_delta)
 
     def _get_fan_club_joins(self) -> int:
-        """Best estimate of fan club joins during this stream.
+        """Fan club joins during this stream.
 
-        Uses two independent sources, taking the maximum since each can
-        miss some joins under different failure modes:
+        Authoritative: content-based delta from FansclubMessage.
+          total_members parsed from the content string is the absolute
+          member count.  Delta = end - start gives the precise join count
+          for this stream, immune to duplicate WS messages.
 
-        Primary:   fan_club_joins — direct count of type=2 FansclubMessage
-                   events.  Most accurate; each event IS one join.
-        Floor:     fan_club_gift_joins — 入团卡 gift count.  Catches joins
-                   when FansclubMessage protobuf parsing misses events.
-
-        Content-based delta (end_count - start_count) is NOT used because
-        total_members from FansclubMessage is a CHANNEL-LIFETIME cumulative
-        count that crosses stream boundaries and would produce inflated deltas.
+        Fallback: if start_count wasn't captured (reconnect gap), use
+          event counter or gift counter as a floor.
         """
+        if self.fan_club_start_count > 0 and self.fan_club_end_count > 0:
+            return max(0, self.fan_club_end_count - self.fan_club_start_count)
         return max(self.fan_club_joins, self.fan_club_gift_joins)
 
     def _should_count_gift(self, group_id: int, gift_name: str, user_id: int,
@@ -1685,8 +2090,59 @@ class DouyinLiveChecker:
         for attempt in range(max_retries):
             url = f"https://live.douyin.com/{self.live_id}"
             try:
-                resp = requests.get(url, headers=self.HEADERS, cookies=self.cookie, verify=False, timeout=15)
+                # Strip s_v_web_id from page request — Douyin returns empty
+                # responses when this device-fingerprint cookie is present
+                # on a non-browser HTTP client.  The cookie is still needed
+                # for API calls (DouyinAuth) but NOT for the HTML page fetch.
+                page_cookies = {
+                    k: v for k, v in self.cookie.items()
+                    if k != "s_v_web_id"
+                }
+                resp = requests.get(url, headers=self.HEADERS, cookies=page_cookies, verify=False, timeout=15)
                 resp.raise_for_status()
+
+                # ── Cookie/session health check ──────────────────────────
+                # Detect expired cookies, login redirects, and CAPTCHA pages
+                # BEFORE parsing — these are NOT "stream offline" events.
+                _final_url = resp.url or ""
+                _body_lower = (resp.text or "").lower()
+                _is_cookie_expired = (
+                    "passport.douyin.com" in _final_url
+                    or "sso.douyin.com" in _final_url
+                    or "login" in _final_url
+                    or "captcha" in _body_lower[:2000]
+                    or "verify" in _body_lower[:2000]
+                    or len(resp.text or "") < 200  # empty/blocked response
+                )
+                if _is_cookie_expired:
+                    logger.error(
+                        f"[CheckStatus] Cookie appears EXPIRED — "
+                        f"final_url={_final_url[:100]}, "
+                        f"body_len={len(resp.text or '')}"
+                    )
+                    # Mark cookie unhealthy for the refresher to see
+                    try:
+                        from cookie_manager import CookieManager
+                        CookieManager().mark_unhealthy()
+                    except Exception:
+                        pass
+                    # Telegram alert — cookie expiry is critical
+                    self._send_health_alert(
+                        f"Douyin cookie EXPIRED for room {self.live_id} "
+                        f"(url={_final_url[:80]}, body_len={len(resp.text or '')})",
+                        state="douyin_cookie_expired",
+                    )
+                    # Fall through to return last known status — don't
+                    # report OFFLINE when we can't actually tell.
+                    last = getattr(self, '_last_status', None)
+                    if last:
+                        logger.warning(
+                            f"[CheckStatus] Returning last known status "
+                            f"({last}) — cookie may be expired"
+                        )
+                        return {"room_status": last}
+                    return {"room_status": self.STATUS_OFFLINE}
+
                 ttwid = ""
                 if 'ttwid' in resp.cookies:
                     ttwid = resp.cookies['ttwid']
@@ -1742,6 +2198,91 @@ class DouyinLiveChecker:
                         continue
 
                 logger.warning("Could not find room info in page HTML")
+                # Fallback: try broader patterns that may survive HTML changes
+                # Pattern 1: Look for RENDER_DATA JSON blob (often contains room status)
+                render_data_match = re.search(r'<script[^>]*id="RENDER_DATA"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
+                if render_data_match:
+                    try:
+                        import urllib.parse
+                        raw = render_data_match.group(1)
+                        decoded = urllib.parse.unquote(raw)
+                        render_json = json.loads(decoded)
+                        # Navigate RENDER_DATA to find room status
+                        room_data = (render_json.get('app', {})
+                                     .get('initialState', {})
+                                     .get('roomStore', {})
+                                     .get('roomInfo', {})
+                                     .get('room', {}))
+                        if room_data:
+                            status = str(room_data.get('status', self.STATUS_OFFLINE))
+                            title = room_data.get('title', '')
+                            rid = str(room_data.get('id_str', ''))
+                            anchor_info = room_data.get('anchor', {})
+                            sec_uid = anchor_info.get('sec_uid', '')
+                            nickname = anchor_info.get('nickname', '')
+                            user_id = str(anchor_info.get('id_str', ''))
+                            logger.info(f"[Fallback] RENDER_DATA room: status={status}, title={title}")
+                            return {
+                                "room_id": rid,
+                                "user_id": user_id,
+                                "user_unique_id": user_id,
+                                "anchor_id": user_id,
+                                "sec_uid": sec_uid,
+                                "ttwid": ttwid,
+                                "room_status": status,
+                                "room_title": title,
+                                "anchor_nickname": nickname,
+                            }
+                    except Exception as e:
+                        logger.debug(f"[Fallback] RENDER_DATA parse failed: {e}")
+
+                # Pattern 2: Try __INITIAL_STATE__ JSON blob (brace-counting parse
+                # to handle nested objects — regex {.*?} breaks on nesting)
+                init_start = resp.text.find('window.__INITIAL_STATE__')
+                if init_start != -1:
+                    try:
+                        # Find the first '{' after the '=' sign
+                        eq_pos = resp.text.find('=', init_start)
+                        brace_start = resp.text.find('{', eq_pos)
+                        if brace_start != -1:
+                            # Count braces to find matching closing brace
+                            depth = 1
+                            pos = brace_start + 1
+                            while depth > 0 and pos < len(resp.text):
+                                if resp.text[pos] == '{':
+                                    depth += 1
+                                elif resp.text[pos] == '}':
+                                    depth -= 1
+                                pos += 1
+                            json_str = resp.text[brace_start:pos]
+                            init_json = json.loads(json_str)
+                            room = init_json.get('roomInfo', {}).get('room', {})
+                            if room:
+                                status = str(room.get('status', self.STATUS_OFFLINE))
+                                title = room.get('title', '')
+                                rid = str(room.get('id_str', ''))
+                                anchor = room.get('anchor', {})
+                                sec_uid = anchor.get('sec_uid', '')
+                                nickname = anchor.get('nickname', '')
+                                user_id = str(anchor.get('id_str', ''))
+                                logger.info(f"[Fallback] __INITIAL_STATE__ room: status={status}, title={title}")
+                                return {
+                                    "room_id": rid,
+                                    "user_id": user_id,
+                                    "user_unique_id": user_id,
+                                    "anchor_id": user_id,
+                                    "sec_uid": sec_uid,
+                                    "ttwid": ttwid,
+                                    "room_status": status,
+                                    "room_title": title,
+                                    "anchor_nickname": nickname,
+                                }
+                    except Exception as e:
+                        logger.debug(f"[Fallback] __INITIAL_STATE__ parse failed: {e}")
+
+                # All patterns failed — log a snippet for debugging
+                snippet = resp.text[:500] if resp.text else "(empty response)"
+                logger.error(f"[CheckStatus] ALL patterns failed. HTML snippet: {snippet}...")
                 return {"room_status": self.STATUS_OFFLINE}
 
             except requests.Timeout as e:
@@ -1774,13 +2315,15 @@ class WeiboPoster:
     WEB_HOST = "https://weibo.com"
     POST_URL = f"{WEB_HOST}/ajax/statuses/update"
 
+    # Weibo error codes that indicate cookie/auth expiry
+    _AUTH_CODES = {"100001", "100005", "21301", "21315", "21332"}
+
     def __init__(self, web_cookie: str):
         self.web_cookie = web_cookie
 
-    def post_tweet(self, content: str) -> bool:
+    def post_tweet(self, content: str, max_retries: int = 3) -> bool:
         # Remove emoji characters before posting to Weibo
         content = strip_emoji(content)
-        cookies = self._cookies()
         xsrf_token = self._extract_xsrf()
         logger.info(f"Posting to Weibo: {content[:80]}...")
 
@@ -1808,18 +2351,71 @@ class WeiboPoster:
             "approval_state": "0",
         }
 
+        last_error = None
+        last_error_code = None
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(self.POST_URL, headers=headers, data=data, timeout=15)
+                result = resp.json()
+                if result.get("ok") == 1:
+                    logger.info(f"Weibo posted successfully!")
+                    return True
+                else:
+                    error_code = result.get('errno', result.get('code', 'unknown'))
+                    error_msg = result.get('msg', str(result))
+                    logger.error(f"Weibo API returned error (attempt {attempt + 1}/{max_retries}): errno={error_code}, msg={error_msg}")
+                    last_error = f"errno={error_code}"
+                    last_error_code = str(error_code)
+
+                    # Rate-limit errors: back off longer
+                    if error_code in (100005, 100006, 100100):
+                        if attempt < max_retries - 1:
+                            wait = 30 * (attempt + 1)
+                            logger.warning(f"Weibo rate-limited, waiting {wait}s before retry...")
+                            time.sleep(wait)
+                            continue
+                    elif attempt < max_retries - 1:
+                        wait = 5 * (attempt + 1)
+                        logger.warning(f"Retrying Weibo post in {wait}s...")
+                        time.sleep(wait)
+                        continue
+            except requests.Timeout:
+                last_error = "timeout"
+                if attempt < max_retries - 1:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Weibo post timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Weibo post failed (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+        logger.error(f"Failed to post Weibo after {max_retries} attempts: {last_error}")
+
+        # Telegram alert if the final error looks like a cookie/auth issue
+        if last_error_code and str(last_error_code) in self._AUTH_CODES:
+            self._send_weibo_health_alert(
+                f"Weibo post FAILED after {max_retries} retries — "
+                f"auth error code={last_error_code}"
+            )
+        return False
+
+    @staticmethod
+    def _send_weibo_health_alert(message: str):
+        """Send a Telegram alert for Weibo cookie/auth issues (best-effort)."""
         try:
-            resp = requests.post(self.POST_URL, headers=headers, data=data, timeout=15)
-            result = resp.json()
-            if result.get("ok") == 1:
-                logger.info(f"Weibo posted successfully!")
-                return True
-            else:
-                logger.error(f"Weibo API returned error: {result}")
-                return False
-        except Exception as e:
-            logger.error(f"Failed to post Weibo: {e}")
-            return False
+            from telegram_notifier import TelegramNotifier
+            notifier = TelegramNotifier()
+            notifier.send(
+                f"[StreamMonitor] {message}",
+                state="weibo_cookie_expired",
+            )
+        except Exception:
+            pass
 
     def _cookies(self) -> dict:
         result = {}
@@ -1891,13 +2487,13 @@ class StreamMonitor:
         if offline_summary_template:
             offline_summary_template = offline_summary_template.replace('\\n', '\n')
         self.offline_summary_template = offline_summary_template or \
-            "{name} 直播结束\n场观：{views}\n点赞：{likes}\n最高在线：{peak}\n平均在线：{avg}\n新增粉丝：{followers}\n新增粉丝团：{members}\n点亮灯牌：{badges}\n热门礼物：{gifts}"
+            "{name} 直播结束\n场观：{views}\n点赞：{likes}\n最高在线：{peak}\n平均在线：{avg}\n关注涨幅度：{followers}\n新增粉丝团：{members}\n点亮灯牌：{badges}\n热门礼物：{gifts}"
 
         self.checker = DouyinLiveChecker(live_id, dy_cookie_str)
         self.poster = WeiboPoster(weibo_cookie)
 
         self.stats_recorder = None
-        self.log_file = os.path.join(os.path.dirname(__file__), 'notification_log.json')
+        self.log_file = NOTIF_CSV_FILE  # CSV log — efficient O(1) append
 
         # FIX: Store anchor nickname from HTTP page data as fallback
         # Stats recorder (WebSocket/API) may fail to fetch nickname,
@@ -1909,6 +2505,19 @@ class StreamMonitor:
         # After CONSECUTIVE_OFFLINE_LIMIT consecutive detections, force handle_offline.
         self._consecutive_offline_count = 0
         self.CONSECUTIVE_OFFLINE_LIMIT = 2
+
+        # Cookie reload: periodically re-read cookies.json so mid-stream
+        # cookie expiry doesn't silently break monitoring.  The
+        # CookieRefresher (separate PM2 process) writes refreshed cookies.
+        self._last_cookie_reload = datetime.now()
+        self._cookie_reload_interval = 300  # every 5 minutes
+
+        # Telegram health alerts (fire-and-forget, best-effort)
+        try:
+            from telegram_notifier import TelegramNotifier
+            self._telegram = TelegramNotifier()
+        except Exception:
+            self._telegram = None
 
         # Validate templates at startup
         self._validate_template(self.live_template, self._get_live_template_keys())
@@ -1957,8 +2566,20 @@ class StreamMonitor:
         else:
             avg = ""
 
-        # ── followers ──
-        followers_str = str(r._get_new_follows())
+        # ── followers (关注涨幅度) ──
+        # Primary: WS followCount delta with before→after from CSV boundaries.
+        # The "first log" is ws_follow_first (earliest SocialMessage.followCount).
+        # The "last log" is ws_follow_last (latest SocialMessage.followCount).
+        # Fallback: API follower_before → follower_after if WS never fired.
+        fb = r.ws_follow_first if r.ws_follow_first > 0 else r.follower_before
+        fa = r.ws_follow_last if r.ws_follow_last > 0 else r.follower_after
+        delta = r._get_new_follows()
+        if fb > 0 and fa > 0:
+            followers_str = f"{fmt_wan(fb)} → {fmt_wan(fa)}（+{fmt_wan(delta)}）"
+        elif delta > 0:
+            followers_str = f"+{fmt_wan(delta)}"
+        else:
+            followers_str = "0"
 
         # ── fan club joins ──
         joins = r._get_fan_club_joins()
@@ -2023,24 +2644,101 @@ class StreamMonitor:
                 f"Valid placeholders: {', '.join(sorted(valid_keys))}"
             )
 
-    def log_notification(self, event_type: str, content: str, success: bool):
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "live_id": self.live_id,
-            "event": event_type,
-            "content": content,
-            "success": success,
-        }
+    def _reload_cookies(self):
+        """Re-read cookies.json + weibo_cookies.json and propagate to
+        checker, stats recorder, and Weibo poster.
+
+        Safe to call frequently — only reloads if the interval has elapsed.
+        Returns True if ANY cookie was reloaded, False otherwise.
+        """
+        now = datetime.now()
+        if (now - self._last_cookie_reload).total_seconds() < self._cookie_reload_interval:
+            return False
+        self._last_cookie_reload = now
+
+        reloaded_any = False
+
+        # ── Douyin cookie ──────────────────────────────────────────
         try:
-            logs = []
-            if os.path.exists(self.log_file):
-                with open(self.log_file, 'r', encoding='utf-8') as f:
-                    logs = json.load(f)
-            logs.append(log_entry)
-            with open(self.log_file, 'w', encoding='utf-8') as f:
-                json.dump(logs, f, ensure_ascii=False, indent=2)
+            from cookie_manager import CookieManager
+            mgr = CookieManager()
+            data = mgr.load()
+            new_cookie = data.get('cookie_str', '')
+            if new_cookie and new_cookie != self.dy_cookie_str:
+                logger.info(f"[CookieReload] Refreshing Douyin cookie "
+                            f"(health={data.get('health', 'unknown')}, "
+                            f"refresh_count={data.get('refresh_count', 0)})")
+                self.dy_cookie_str = new_cookie
+                self.checker.cookie = DouyinLiveChecker._parse_cookie(new_cookie)
+                if self.stats_recorder and self.stats_recorder.is_running():
+                    self.stats_recorder.cookie_str = new_cookie
+                reloaded_any = True
         except Exception as e:
-            logger.error(f"Error writing notification log: {e}")
+            logger.warning(f"[CookieReload] Douyin cookie reload failed: {e}")
+
+        # ── Weibo cookie ───────────────────────────────────────────
+        try:
+            from weibo_cookie_manager import WeiboCookieManager
+            wmgr = WeiboCookieManager()
+            wdata = wmgr.load()
+            new_weibo = wdata.get('cookie_str', '')
+            if new_weibo and new_weibo != self.poster.web_cookie:
+                logger.info(f"[CookieReload] Refreshing Weibo cookie "
+                            f"(health={wdata.get('health', 'unknown')}, "
+                            f"refresh_count={wdata.get('refresh_count', 0)})")
+                self.poster.web_cookie = new_weibo
+                reloaded_any = True
+        except Exception as e:
+            logger.warning(f"[CookieReload] Weibo cookie reload failed: {e}")
+
+        return reloaded_any
+
+    def _send_health_alert(self, message: str, state: str = None):
+        """Send a health alert via Telegram (best-effort, never raises)."""
+        if self._telegram:
+            try:
+                self._telegram.send(f"[StreamMonitor] {message}", state=state)
+            except Exception:
+                pass
+
+    def log_notification(self, event_type: str, content: str, success: bool):
+        """Append a notification event to the CSV log.
+
+        Uses atomic append (temp + rename) for crash safety.
+        Much more efficient than the old JSON approach (O(1) vs O(n²)).
+        """
+        import csv as _csv
+        try:
+            _exists = os.path.exists(NOTIF_CSV_FILE)
+            _tmp = NOTIF_CSV_FILE + '.tmp'
+
+            if _exists:
+                with open(NOTIF_CSV_FILE, 'r', encoding='utf-8', newline='') as _rf:
+                    _existing = _rf.read()
+                with open(_tmp, 'w', encoding='utf-8', newline='') as _wf:
+                    _wf.write(_existing)
+            else:
+                open(_tmp, 'w').close()
+
+            with open(_tmp, 'a', encoding='utf-8', newline='') as _af:
+                _writer = _csv.writer(_af)
+                if not _exists:
+                    _writer.writerow([
+                        'timestamp', 'live_id', 'event_type',
+                        'content_preview', 'success',
+                    ])
+                # Truncate content to avoid CSV-breaking newlines in cells
+                _preview = content.replace('\n', '\\n').replace('\r', '')[:200]
+                _writer.writerow([
+                    datetime.now().isoformat(),
+                    self.live_id,
+                    event_type,
+                    _preview,
+                    1 if success else 0,
+                ])
+            os.replace(_tmp, NOTIF_CSV_FILE)
+        except Exception as e:
+            logger.error(f"Error writing notification CSV: {e}")
 
     def handle_live(self, room_info: dict):
         title = room_info.get('room_title', self.live_title or '')
@@ -2056,6 +2754,9 @@ class StreamMonitor:
             self.stats_recorder = LiveStatsRecorder(
                 self.live_id, self.dy_cookie_str, verbose=self.verbose
             )
+            # Pass HTTP-parsed room_info as fallback for WebSocket setup,
+            # so _connect_ws doesn't need to re-fetch via get_live_info
+            self.stats_recorder._http_room_info = room_info
             self.stats_recorder.start_background()
             # Give the recorder a moment to fetch anchor info from the API
             time.sleep(2)
@@ -2131,36 +2832,138 @@ class StreamMonitor:
                 self.stats_recorder.stop()
                 return
 
-            # Fetch follower count directly via _get_follower.
-            # Retry up to 3 times with backoff in case the API is slow.
-            for attempt in range(3):
-                if attempt > 0:
-                    wait = 10 * attempt  # 10s, 20s
-                    logger.info(
-                        f"Waiting {wait}s before follower retry "
-                        f"{attempt + 1}/3..."
-                    )
-                    time.sleep(wait)
-                fc = self.stats_recorder._get_follower(auth, sec_uid)
-                if fc > 0:
-                    self.stats_recorder.follower_after = fc
-                    post_snapshot_ok = True
-                    logger.info(
-                        f"Follower fetch succeeded: "
-                        f"follower_after={fc:,}"
-                    )
-                    break
-                else:
-                    logger.warning(
-                        f"Follower fetch attempt {attempt + 1}/3 returned 0 "
-                        f"— retrying..."
-                    )
+            # ── Final follower count (stream-end post-snapshot) ───────
+            # Priority order:
+            #   1. WebSocket followCount (uint64 from SocialMessage payload)
+            #      — the anchor's ABSOLUTE precise follower count.  This is
+            #      the ground truth; no API call needed.
+            #   2. API precise int64 (when follower_count field is an integer,
+            #      not a 万-rounded string).  Used as fallback when the WS
+            #      never emitted a SocialMessage.
+            #   3. Per-event estimate (follower_before + new_follows).
+            #
+            # 万-rounded values are EXPLICITLY REJECTED for the final delta
+            # — they bake in ±500 precision loss and freeze the count.
 
-            if not post_snapshot_ok:
+            r = self.stats_recorder
+
+            # ── Choose the newer data source: WS or HTTP ─────────────
+            # At stream end, the source with the more recent timestamp
+            # is most trustworthy.  WS may have stalled hours ago while
+            # HTTP kept refreshing.
+            ws_fresh = r.ws_follow_last_time if r.ws_follow_last > 0 else None
+            http_fresh = r._last_http_refresh if r.http_follow_last > 0 else None
+            use_ws = False
+            if ws_fresh and http_fresh:
+                use_ws = ws_fresh > http_fresh  # newer wins
+            elif ws_fresh:
+                use_ws = True
+            # else: both None → no data, will retry
+
+            if use_ws:
+                r.follower_after = r.ws_follow_last
+                post_snapshot_ok = True
+                logger.info(
+                    f"[Offline] Using WS followCount (newer): "
+                    f"follower_after={r.follower_after:,}, "
+                    f"ws_time={ws_fresh.isoformat() if ws_fresh else 'N/A'}, "
+                    f"ws_delta={r.ws_follow_last - r.ws_follow_first}"
+                )
+            elif http_fresh:
+                r.follower_after = r.http_follow_last
+                post_snapshot_ok = True
+                logger.info(
+                    f"[Offline] Using HTTP followCount (newer): "
+                    f"follower_after={r.follower_after:,}, "
+                    f"http_time={http_fresh.isoformat() if http_fresh else 'N/A'}, "
+                    f"http_delta={r.http_follow_last - r.http_follow_first}"
+                )
+            elif r.http_follow_last > 0:
+                # http_fresh was None (_last_http_refresh not set, e.g. CSV
+                # recovery path where http_follow_last was restored from CSV
+                # but no live HTTP refresh timestamp exists yet).  The data
+                # is valid — use it rather than falling through to the API
+                # retry loop (which may fail on repeated 万-rounded values).
+                r.follower_after = r.http_follow_last
+                post_snapshot_ok = True
+                logger.info(
+                    f"[Offline] Using http_follow_last (no timestamp, "
+                    f"CSV recovery): "
+                    f"follower_after={r.follower_after:,}, "
+                    f"http_delta={r.http_follow_last - r.http_follow_first}"
+                )
+            else:
+                # ── No WS or HTTP — try API fetch ──────────────────
+                logger.info(
+                    "[Offline] No WS SocialMessage received — "
+                    "falling back to API follower fetch"
+                )
+                for attempt in range(3):
+                    if attempt > 0:
+                        wait = 10 * attempt
+                        logger.info(
+                            f"Waiting {wait}s before follower retry "
+                            f"{attempt + 1}/3..."
+                        )
+                        time.sleep(wait)
+
+                    # Call API directly (not via _get_follower) so we can
+                    # inspect the RAW follower_count before parsing.
+                    try:
+                        import sys as _sys
+                        user_url = f"https://www.douyin.com/user/{sec_uid}"
+                        with _suppress_stdout():
+                            _ui = DouyinAPI.get_user_info(auth, user_url)
+                        _ud = _ui.get('user', {})
+                        _raw_fc = _ud.get('follower_count', 0)
+
+                        # REJECT 万-rounded strings — they silently
+                        # corrupt the follower delta with ±500 error.
+                        if isinstance(_raw_fc, str) and '万' in _raw_fc:
+                            logger.warning(
+                                f"[Offline] API returned 万-rounded "
+                                f"follower_count=\"{_raw_fc}\" — "
+                                f"REJECTED for final snapshot"
+                            )
+                            # Use WS per-event estimate as floor.
+                            # DON'T BREAK — retry may give precise int.
+                            r.follower_after = r.ws_follow_last or r.follower_before
+                        else:
+                            fc = int(float(_raw_fc.replace('万', ''))
+                                     if isinstance(_raw_fc, str)
+                                     else _raw_fc)
+                            if fc > 0:
+                                r.follower_after = r.ws_follow_last if r.ws_follow_last > 0 else int(fc)
+                                logger.info(
+                                    f"[Offline] API follower fetch OK: "
+                                    f"raw={_raw_fc}, "
+                                    f"follower_after={r.follower_after:,}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[Offline] API returned follower_count=0"
+                                )
+                                continue
+                        post_snapshot_ok = True
+                        break
+                    except Exception as _e:
+                        logger.warning(
+                            f"[Offline] Follower fetch attempt "
+                            f"{attempt + 1}/3 failed: {_e}"
+                        )
+
+            # If the API never returned a usable precise value but
+            # follower_after was already populated (WS followCount or
+            # per-event estimate from periodic refreshes), proceed anyway.
+            if not post_snapshot_ok and r.follower_after <= 0:
                 logger.error(
-                    "All 3 follower fetch attempts returned 0. "
+                    "All 3 follower fetch attempts failed AND "
+                    "follower_after is still 0. "
                     "SKIPPING Weibo post — follower delta would be unreliable."
                 )
+                self._send_health_alert(
+                    f"Follower fetch FAILED for room {self.live_id} — Weibo summary was skipped",
+                    state="follower_fetch_failed")
                 self.log_notification(
                     "live_end_skipped_no_snapshot",
                     f"follower_after still 0 after 3 attempts",
@@ -2169,6 +2972,12 @@ class StreamMonitor:
                 # Still stop the recorder so it doesn't linger
                 self.stats_recorder.stop()
                 return
+            elif not post_snapshot_ok and r.follower_after > 0:
+                logger.warning(
+                    f"[Offline] API returned only 万-rounded values, "
+                    f"but follower_after={r.follower_after:,} from "
+                    f"WS/estimate — proceeding with offline summary"
+                )
 
         # Build summary text for Weibo using the shared computation.
         if self.stats_recorder is not None:
@@ -2285,17 +3094,17 @@ class StreamMonitor:
 
     def run_once(self) -> bool:
         now = datetime.now()
-        print(f"\n[{now.strftime('%H:%M:%S')}] Checking stream status...", flush=True)
+        safe_print(f"\n[{now.strftime('%H:%M:%S')}] Checking stream status...", flush=True)
+
+        # Periodically reload cookies from cookies.json so mid-stream
+        # cookie expiry doesn't silently break monitoring.
+        self._reload_cookies()
 
         try:
             # Suppress stdout from check_status() which may print debug dicts
-            old_stdout = sys.stdout
-            sys.stdout = open(os.devnull, 'w')
-            try:
+            with _suppress_stdout():
                 room_info = self.checker.check_status()
-            finally:
-                sys.stdout = old_stdout
-            
+
             logger.debug(f"check_status() returned: {list(room_info.keys())}")
         except Exception as e:
             logger.error(f"Failed to check stream status: {e}")
@@ -2330,6 +3139,9 @@ class StreamMonitor:
                                 logger.info("WS recovery successful! Resuming/recovered data collection.")
                             else:
                                 logger.error("WS recovery failed. Using incomplete data for offline summary.")
+                                self._send_health_alert(
+                                    f"WS recovery FAILED for room {self.live_id} — data may be incomplete",
+                                    state="ws_recovery_failed")
                         else:
                             logger.warning("Recorder died but not due to WS. Keeping old recorder.")
                     else:
@@ -2346,9 +3158,9 @@ class StreamMonitor:
                 # skip the start Weibo to avoid duplicate notifications.
                 if _stats_json_indicates_restart(self.live_id):
                     self._live_posted = True
-                    print(f"[{now.strftime('%H:%M:%S')}] Stream is LIVE (restart) – resuming stats without notification", flush=True)
+                    safe_print(f"[{now.strftime('%H:%M:%S')}] Stream is LIVE (restart) – resuming stats without notification", flush=True)
                 else:
-                    print(f"[{now.strftime('%H:%M:%S')}] Stream is LIVE – starting stats recording + notification", flush=True)
+                    safe_print(f"[{now.strftime('%H:%M:%S')}] Stream is LIVE – starting stats recording + notification", flush=True)
                 self.handle_live(room_info)
                 # Wait for _take_pre_snapshot() to finish (max 15s).
                 # follower_before always comes from a fresh API capture on
@@ -2357,7 +3169,7 @@ class StreamMonitor:
                     self.stats_recorder._pre_snapshot_done.wait(timeout=15)
                 changed = True
             else:
-                print(f"[{now.strftime('%H:%M:%S')}] Stream is OFFLINE – waiting for live", flush=True)
+                safe_print(f"[{now.strftime('%H:%M:%S')}] Stream is OFFLINE – waiting for live", flush=True)
             self.current_status = new_status
         elif new_status != self.current_status:
             changed = True
@@ -2365,7 +3177,7 @@ class StreamMonitor:
                 # New stream cycle — reset guards from the previous stream.
                 self._live_posted = False
                 self._summary_posted = False
-                print(f"[{now.strftime('%H:%M:%S')}] Stream went LIVE – starting stats recording + notification", flush=True)
+                safe_print(f"[{now.strftime('%H:%M:%S')}] Stream went LIVE – starting stats recording + notification", flush=True)
                 self.handle_live(room_info)
             else:
                 # FIX: Handle case where Douyin WebSocket stays connected indefinitely
@@ -2380,7 +3192,7 @@ class StreamMonitor:
                         )
                         # Reset status back to LIVE so we don't lose live state
                         self.current_status = DouyinLiveChecker.STATUS_LIVE
-                        print(f"[{now.strftime('%H:%M:%S')}] ⚠ HTTP says OFFLINE but WS still running ({self._consecutive_offline_count}/{self.CONSECUTIVE_OFFLINE_LIMIT})", flush=True)
+                        safe_print(f"[{now.strftime('%H:%M:%S')}] ⚠ HTTP says OFFLINE but WS still running ({self._consecutive_offline_count}/{self.CONSECUTIVE_OFFLINE_LIMIT})", flush=True)
                         time.sleep(5)
                         return False
                     else:
@@ -2388,13 +3200,13 @@ class StreamMonitor:
                             f"HTTP OFFLINE detected {self.CONSECUTIVE_OFFLINE_LIMIT} consecutive times. "
                             f"Forcing offline event despite WS being connected."
                         )
-                        print(f"[{now.strftime('%H:%M:%S')}] Stream went OFFLINE (confirmed by {self.CONSECUTIVE_OFFLINE_LIMIT} HTTP checks) – posting notification", flush=True)
+                        safe_print(f"[{now.strftime('%H:%M:%S')}] Stream went OFFLINE (confirmed by {self.CONSECUTIVE_OFFLINE_LIMIT} HTTP checks) – posting notification", flush=True)
                         # handle_offline will stop the recorder and take post-snapshot internally
                         self.handle_offline(room_info)
                         self.current_status = new_status
                         return True
 
-                print(f"[{now.strftime('%H:%M:%S')}] Stream went OFFLINE – posting notification", flush=True)
+                safe_print(f"[{now.strftime('%H:%M:%S')}] Stream went OFFLINE – posting notification", flush=True)
                 self.handle_offline(room_info)
             self.current_status = new_status
         else:
@@ -2410,9 +3222,9 @@ class StreamMonitor:
                         uptime = f" | Uptime: {hours}h{mins}m"
                     else:
                         uptime = f" | Uptime: {mins}m{secs}s"
-                viewers = fmt_wan(r.current_viewers) if r.current_viewers else "?"
+                viewers = fmt_wan(r._get_current_viewers()) if r._get_current_viewers() else "?"
                 stats_info = f" | Viewers: {viewers} | Likes: {fmt_wan(r.total_likes) if r.total_likes else '?'}{uptime}"
-                print(f"[{now.strftime('%H:%M:%S')}] Status: {status_text} | Title: {title}{stats_info}", flush=True)
+                safe_print(f"[{now.strftime('%H:%M:%S')}] Status: {status_text} | Title: {title}{stats_info}", flush=True)
                 
                 # Print preview of what will be posted to Weibo
                 # FIX: Use fallback anchor name in preview
@@ -2431,9 +3243,9 @@ class StreamMonitor:
                         gifts=vals['gifts'] if vals['gifts'] else "--",
                         duration=vals['duration'] or "--",
                     )
-                    print(f"\n📋 WEIBO PREVIEW (will post when stream ends):")
-                    print(strip_emoji(preview))
-                    print()
+                    safe_print(f"\n📋 WEIBO PREVIEW (will post when stream ends):")
+                    safe_print(strip_emoji(preview))
+                    safe_print()
                 except Exception as e:
                     logger.debug(f"Error generating preview: {e}")
 
@@ -2450,8 +3262,37 @@ class StreamMonitor:
                             r.fetch_cumulative_via_http(mark_recovery=False)
                         except Exception:
                             pass
+                    # If WS followCount has stalled (>5 min), force an HTTP
+                    # refresh right away so http_delta takes over as authoritative.
+                    elif r._ws_follow_stalled():
+                        logger.debug("[Main Loop] WS followCount stalled — forcing HTTP refresh...")
+                        try:
+                            r.fetch_cumulative_via_http(mark_recovery=False)
+                        except Exception:
+                            pass
+                        # Also restart WS to get a fresh session where
+                        # followCount might work again.  Limited to once
+                        # per 10 min to avoid restart loops.
+                        cooldown_ok = (r._ws_last_restart_time is None or
+                                       (now - r._ws_last_restart_time).total_seconds() > 600)
+                        if cooldown_ok and not r.ws_disconnected and r._ws_restart_count < 5:
+                            r._ws_restart_count += 1
+                            r._ws_last_restart_time = now
+                            # Reset followCount counters so new session starts clean
+                            r.ws_follow_first = 0
+                            r.ws_follow_last = 0
+                            r.ws_follow_last_time = None
+                            logger.warning(
+                                f"[Main Loop] WS followCount stagnant — restarting WS "
+                                f"(attempt {r._ws_restart_count}/5) for fresh session..."
+                            )
+                            try:
+                                r.ws.close()
+                                r.ws_disconnected = True
+                            except Exception:
+                                pass
             else:
-                print(f"[{now.strftime('%H:%M:%S')}] Status: {status_text} | Title: {title}", flush=True)
+                safe_print(f"[{now.strftime('%H:%M:%S')}] Status: {status_text} | Title: {title}", flush=True)
                 # If the recorder thread died (e.g. WebSocket disconnected) but the
                 # stream is still LIVE, keep writing the last known stats so the
                 # dashboard doesn't go completely stagnant.  The ws_connected field
@@ -2491,6 +3332,20 @@ class StreamMonitor:
 
         consecutive_errors = 0
         max_consecutive_errors = 10
+
+        # ── SIGTERM handler: graceful shutdown on PM2 restart ──────────
+        # PM2 sends SIGTERM first, then SIGKILL after 1.6s timeout.
+        # This handler flushes stats to disk so restarts don't lose data.
+        def _handle_sigterm(signum, frame):
+            logger.warning("SIGTERM received — shutting down gracefully...")
+            if self.stats_recorder and self.stats_recorder.is_running():
+                logger.info("Writing final stats before exit...")
+                self.stats_recorder._write_live_stats_json(live=False)
+                self.stats_recorder._write_stats_csv()
+                self.stats_recorder.stop()
+                logger.info("Stats flushed. Exiting.")
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, _handle_sigterm)
 
         while True:
             try:
@@ -2627,7 +3482,7 @@ def main():
         if offline_summary_tpl:
             offline_summary_tpl = offline_summary_tpl.replace('\\n', '\n')
         else:
-            offline_summary_tpl = "{name} 直播结束\n场观：{views}\n点赞：{likes}\n最高在线：{peak}\n平均在线：{avg}\n新增粉丝：{followers}\n新增粉丝团：{members}\n点亮灯牌：{badges}\n热门礼物：{gifts}"
+            offline_summary_tpl = "{name} 直播结束\n场观：{views}\n点赞：{likes}\n最高在线：{peak}\n平均在线：{avg}\n关注涨幅度：{followers}\n新增粉丝团：{members}\n点亮灯牌：{badges}\n热门礼物：{gifts}"
 
         r = recorder
 
@@ -2685,7 +3540,7 @@ def main():
         if offline_summary_tpl:
             offline_summary_tpl = offline_summary_tpl.replace('\\n', '\n')
         else:
-            offline_summary_tpl = "{name} 直播结束\n场观：{views}\n点赞：{likes}\n最高在线：{peak}\n平均在线：{avg}\n新增粉丝：{followers}\n新增粉丝团：{members}\n点亮灯牌：{badges}\n热门礼物：{gifts}"
+            offline_summary_tpl = "{name} 直播结束\n场观：{views}\n点赞：{likes}\n最高在线：{peak}\n平均在线：{avg}\n关注涨幅度：{followers}\n新增粉丝团：{members}\n点亮灯牌：{badges}\n热门礼物：{gifts}"
 
         recorder = LiveStatsRecorder(live_id, dy_cookie, verbose=True)
         recorder.start_background()
@@ -2754,8 +3609,8 @@ def main():
         return
 
     if not weibo_cookie:
-        logger.error("Missing Weibo cookie.  Set WEIBO_COOKIE in .env or pass --weibo-cookie.")
-        sys.exit(1)
+        logger.warning("No Weibo cookie configured — notifications will be logged but not posted. "
+                       "Set WEIBO_COOKIE in .env or pass --weibo-cookie to enable posting.")
 
     offline_summary_tpl = config.get('OFFLINE_SUMMARY_TEMPLATE', '') or ''
 

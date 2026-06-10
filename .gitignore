@@ -11,5 +11,27 @@ state.json
 notification_log.json
 wbi_cache.json
 *.tmp
-.env.bak*
+.env.*
 udo *
+
+# Cookie files (sensitive credentials)
+*ookies.json
+
+# Session / agent artifacts
+%USERPROFILE%/
+.kagent/
+prompt.txt
+review_prompt.txt
+review_short.txt
+
+# Internal planning docs
+docs/superpowers/
+
+# Runtime data
+StreamMonitor/live_stats*.json
+StreamMonitor/stats_timeseries.csv
+StreamMonitor/notification_log.csv
+StreamMonitor/seed_override.json
+
+# Gift prices removed from code
+StreamMonitor/gift_prices.json

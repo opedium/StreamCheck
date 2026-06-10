@@ -1,15 +1,47 @@
-# Environment config (contains secrets)
+# ── Secrets / credentials ────────────────────────────────────────────
 .env
+.env.*
+*.bak
+*.bak2
+cookies.json
+weibo_cookies.json
+bilibili_cookies.json
 
-# Notification log
+# ── Runtime data (regenerated each stream) ───────────────────────────
+live_stats.json
+live_stats_reconstructed.json
+stats_timeseries.csv
+seed_override.json
+
+# ── Notification logs ────────────────────────────────────────────────
+notification_log.csv
 notification_log.json
 
-# Loguru log files
-logs/
-*.log
-
-# Python cache
+# ── Python cache ─────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 
+# ── Log files ────────────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+streammonitor.log
+
+# ── One-off patches (already integrated into main.py) ────────────────
+fix_follower.py
+fix_follower2.py
+main.py.bak
+main.py.bak2
+
+# ── Browser profiles (large, auto-generated) ─────────────────────────
+browser_profile/
+*_browser_profile/
+chromium-data/
+
+# ── System / OS ──────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~

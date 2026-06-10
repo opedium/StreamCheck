@@ -15,7 +15,7 @@ import argparse
 import platform
 from datetime import datetime
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, session, redirect, url_for
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -79,6 +79,40 @@ def read_live_stats() -> dict:
     except (json.JSONDecodeError, OSError):
         pass
     return {"live": False}
+
+
+# ── Optional session auth ────────────────────────────────────────
+# Set STREAM_WEB_USERNAME + STREAM_WEB_PASSWORD in .env to protect
+# all routes with a login page + signed session cookie.
+# Unset (default) = open access, backward compatible.
+# Password is sent only once (on login), then a signed session cookie
+# takes over — safe over plain HTTP on a public IP for internal use.
+_WEB_USERNAME = os.environ.get('STREAM_WEB_USERNAME', '')
+_WEB_PASSWORD = os.environ.get('STREAM_WEB_PASSWORD', '')
+_WEB_AUTH_ENABLED = bool(_WEB_USERNAME and _WEB_PASSWORD)
+
+# Secret key for signing session cookies.  Set FLASK_SECRET_KEY in .env
+# for persistent sessions across restarts; otherwise sessions invalidate
+# on every server restart (acceptable for a personal dashboard).
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
+
+
+@app.before_request
+def _check_session():
+    """Session-based auth guard — redirects to /login unless authenticated."""
+    if not _WEB_AUTH_ENABLED:
+        return
+    # Exempt preflight, login, logout, and static assets
+    if request.method == 'OPTIONS':
+        return
+    if request.path in ('/login', '/logout'):
+        return
+    if session.get('auth'):
+        return
+    # Not authenticated — API gets 401 JSON, browser gets redirected
+    if request.path.startswith('/api/'):
+        return jsonify({"error": "unauthorized"}), 401
+    return redirect(url_for('login'))
 
 
 # ── CORS support ────────────────────────────────────────────────────
@@ -261,6 +295,8 @@ def main():
     port = int(os.getenv("WEB_PORT", str(args.port)))
     host = os.getenv("WEB_HOST", args.host)
     debug = args.debug or os.getenv("WEB_DEBUG", "").lower() in ("1", "true", "yes")
+    if debug and host == "0.0.0.0":
+        logger.warning("WEB_DEBUG is enabled on 0.0.0.0 — Werkzeug debugger is exposed to the network!")
 
     logger.info("=" * 60)
     logger.info("  StreamMonitor Web Server")
