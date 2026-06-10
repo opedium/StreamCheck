@@ -146,10 +146,12 @@ class WeiboPoster:
             return False
 
     def check_validity(self) -> bool:
-        """Verify the Weibo cookie is still valid by hitting weibo.com/login.
+        """Verify the Weibo cookie is still valid by hitting weibo.com.
 
-        A working cookie loads the page normally; an expired cookie redirects
-        to passport/login.  Returns True if the cookie is valid.
+        A working cookie loads the homepage (HTTP 200); an expired cookie
+        redirects to passport/login.  Uses the homepage instead of /login
+        because /login always redirects to passport regardless of cookie
+        validity (Weibo's login flow always bounces through passport).
         """
         headers = {
             "User-Agent": (
@@ -161,7 +163,7 @@ class WeiboPoster:
         }
         try:
             resp = requests.get(
-                "https://weibo.com/login",
+                "https://weibo.com/",
                 headers=headers,
                 allow_redirects=True,
                 timeout=15,

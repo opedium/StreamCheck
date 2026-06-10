@@ -247,8 +247,10 @@ class BilibiliCookieRefresher:
                 "Referer": "https://www.bilibili.com/",
             }
             # Test against the nav API (lightweight, returns account info)
+            # Uses api.bilibili.com instead of space.bilibili.com because
+            # space.bilibili.com returns HTTP 412 (anti-bot) from server IPs.
             resp = _r.get(
-                "https://space.bilibili.com/",
+                "https://api.bilibili.com/x/web-interface/nav",
                 headers=headers,
                 allow_redirects=True,
                 timeout=15,
@@ -268,9 +270,22 @@ class BilibiliCookieRefresher:
                     flush=True,
                 )
                 return False
+            # API returns JSON; check code==0 for valid auth
+            try:
+                j = resp.json()
+                if j.get("code") != 0:
+                    print(
+                        f"[BilibiliCookieRefresher] Test FAILED: "
+                        f"API code={j.get('code')} — not authenticated",
+                        flush=True,
+                    )
+                    return False
+                uname = j.get("data", {}).get("uname", "?")
+            except Exception:
+                uname = "?"
             print(
                 f"[BilibiliCookieRefresher] Test PASSED: "
-                f"status={resp.status_code}, url={final_url[:60]}",
+                f"user={uname}",
                 flush=True,
             )
             return True
