@@ -21,6 +21,12 @@ from loguru import logger
 
 from wbi_sign import get_wbi_keys, sign_params
 
+# Paths to shared cookie JSON files (written by StreamMonitor cookie refreshers)
+_CHECK_DIR = os.path.dirname(__file__)
+_STREAMMONITOR_DIR = os.path.join(_CHECK_DIR, "..", "StreamMonitor")
+_WEIBO_COOKIES_FILE = os.path.join(_STREAMMONITOR_DIR, "weibo_cookies.json")
+_BILIBILI_COOKIES_FILE = os.path.join(_STREAMMONITOR_DIR, "bilibili_cookies.json")
+
 # Force stdout/stderr to be unbuffered so log messages appear immediately
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
@@ -139,6 +145,44 @@ class WeiboPoster:
             logger.error(f"Failed to post to Weibo: {e}")
             return False
 
+    def check_validity(self) -> bool:
+        """Verify the Weibo cookie is still valid by hitting weibo.com/login.
+
+        A working cookie loads the page normally; an expired cookie redirects
+        to passport/login.  Returns True if the cookie is valid.
+        """
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/138.0.0.0 Safari/537.36"
+            ),
+            "Cookie": self.web_cookie,
+        }
+        try:
+            resp = requests.get(
+                "https://weibo.com/login",
+                headers=headers,
+                allow_redirects=True,
+                timeout=15,
+            )
+            final_url = resp.url or ""
+            if "passport" in final_url or "login" in final_url:
+                logger.warning(
+                    f"Weibo cookie INVALID — redirected to {final_url[:80]}"
+                )
+                return False
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Weibo cookie check failed: HTTP {resp.status_code}"
+                )
+                return False
+            logger.info("Weibo cookie is valid")
+            return True
+        except Exception as e:
+            logger.warning(f"Weibo cookie check error: {e}")
+            return False
+
     def _extract_xsrf(self) -> str:
         """Extract XSRF token from the Web cookie string."""
         for part in self.web_cookie.split(";"):
@@ -155,8 +199,35 @@ class WeiboPoster:
 # Config Loading
 # ======================================================================
 
+def _load_cookie_from_json(json_path: str, env_var: str, label: str) -> str:
+    """Read a cookie string from a shared JSON file, falling back to .env.
+
+    The JSON files are written by the StreamMonitor cookie refreshers and
+    have the format: ``{"cookie_str": "...", "health": "ok", ...}``.
+    """
+    # Try the shared JSON file first (written by cookie refreshers)
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cookie = (data or {}).get("cookie_str", "")
+            if cookie:
+                logger.info(f"Loaded {label} from {json_path}")
+                return cookie
+            else:
+                logger.warning(f"{json_path} exists but has empty cookie_str — falling back to .env")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to read {json_path}: {e} — falling back to .env")
+
+    # Fall back to .env
+    cookie = os.getenv(env_var, "")
+    if cookie:
+        logger.info(f"Loaded {label} from .env ({env_var})")
+    return cookie
+
+
 def load_config() -> dict:
-    """Load configuration from .env file. Returns a dict with all config values."""
+    """Load configuration from shared cookie JSONs (preferred) or .env file."""
     load_dotenv()
 
     mids_str = os.getenv('BILI_MIDS', '')
@@ -169,10 +240,15 @@ def load_config() -> dict:
         logger.error("BILI_MIDS is set but contains no valid member IDs")
         sys.exit(1)
 
-    weibo_cookie = os.getenv('WEIBO_COOKIE', '')
+    weibo_cookie = _load_cookie_from_json(_WEIBO_COOKIES_FILE, 'WEIBO_COOKIE', 'Weibo cookie')
     if not weibo_cookie:
-        logger.error("WEIBO_COOKIE is not set in .env file")
+        logger.error(
+            "Weibo cookie is not available.  "
+            "Set WEIBO_COOKIE in .env or ensure StreamMonitor/weibo_cookies.json exists."
+        )
         sys.exit(1)
+
+    bili_cookie = _load_cookie_from_json(_BILIBILI_COOKIES_FILE, 'BILI_COOKIE', 'Bilibili cookie')
 
     try:
         check_interval = int(os.getenv('CHECK_INTERVAL', '300'))
@@ -187,8 +263,6 @@ def load_config() -> dict:
     weibo_template = os.getenv('WEIBO_TEMPLATE', default_template)
     # Support \n newlines in .env (same pattern as StreamMonitor)
     weibo_template = weibo_template.replace('\\n', '\n')
-
-    bili_cookie = os.getenv('BILI_COOKIE', '')
 
     log_level = os.getenv('LOG_LEVEL', 'INFO')
 
@@ -378,6 +452,14 @@ def main():
     state = StateManager(state_file)
     poster = WeiboPoster(weibo_cookie)
 
+    # Verify Weibo cookie at startup — no point polling if the cookie is dead
+    if not poster.check_validity():
+        logger.error(
+            "Weibo cookie is invalid at startup.  Either refresh the cookie "
+            "manually or wait for the cookie refresher to run."
+        )
+        sys.exit(1)
+
     while True:
         try:
             # Refresh WBI keys (cached daily)
@@ -409,6 +491,15 @@ def main():
                     logger.info(
                         f"[{video['name']}] NEW VIDEO: {video['title']} ({bvid})"
                     )
+
+                    # Re-check cookie validity before posting
+                    if not poster.check_validity():
+                        logger.error(
+                            f"Weibo cookie expired — skipping post for {bvid}, "
+                            f"will retry next cycle"
+                        )
+                        continue
+
                     content = format_template(weibo_template, video, mid)
                     success = poster.post_tweet(content)
                     if success:

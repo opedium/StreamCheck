@@ -63,18 +63,31 @@ def get_uptime() -> str:
 def read_live_stats() -> dict:
     """Read live_stats.json written by main.py.
 
-    Returns the full JSON dict if the file exists and is valid.
-    Returns {"live": False} if the file is missing or unparseable,
+    Returns the full JSON dict if the file exists, is valid, and has a
+    recent ``last_update`` (within STALE_AGE_SECONDS).
+    Returns {"live": False} if the file is missing, unparseable, or stale,
     which tells the caller that no stream is currently being tracked.
     """
+    STALE_AGE_SECONDS = 120  # treat data as stale if last_update >2 min old
     try:
         if os.path.isfile(LIVE_STATS_PATH):
             with open(LIVE_STATS_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                # Let the caller inspect data.get("live") —
-                # an explicit "live": false means the stream ended,
-                # while a missing file means no tracking is active.
+                # ── Staleness guard ──────────────────────────────────
+                # live_stats.json is written every ~5 s when the monitor
+                # is actively tracking a live stream.  If last_update is
+                # too old (monitor crashed, stream ended uncleanly, or
+                # file is from a previous day), treat it as offline.
+                last_update = data.get("last_update", "")
+                if last_update:
+                    try:
+                        last_dt = datetime.fromisoformat(last_update)
+                        age = (datetime.now() - last_dt).total_seconds()
+                        if age > STALE_AGE_SECONDS:
+                            return {"live": False}
+                    except (ValueError, TypeError):
+                        pass  # unparsable timestamp — let data through
                 return data
     except (json.JSONDecodeError, OSError):
         pass

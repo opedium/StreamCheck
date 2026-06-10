@@ -2068,9 +2068,14 @@ class DouyinLiveChecker:
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     }
 
+    # Max time to keep returning cached status after cookie expiry before
+    # forcing OFFLINE so a real stream-end event isn't lost.
+    _COOKIE_EXPIRY_GRACE_SECONDS = 300  # 5 minutes
+
     def __init__(self, live_id: str, cookie_str: str = ""):
         self.live_id = live_id
         self.cookie = self._parse_cookie(cookie_str) if cookie_str else {}
+        self._cookie_expired_since: Optional[float] = None
 
     @staticmethod
     def _parse_cookie(cookie_str: str) -> dict:
@@ -2115,8 +2120,14 @@ class DouyinLiveChecker:
                     or len(resp.text or "") < 200  # empty/blocked response
                 )
                 if _is_cookie_expired:
+                    now = time.time()
+                    if self._cookie_expired_since is None:
+                        self._cookie_expired_since = now
+                    elapsed = now - self._cookie_expired_since
+
                     logger.error(
-                        f"[CheckStatus] Cookie appears EXPIRED — "
+                        f"[CheckStatus] Cookie appears EXPIRED "
+                        f"({elapsed:.0f}s ago) — "
                         f"final_url={_final_url[:100]}, "
                         f"body_len={len(resp.text or '')}"
                     )
@@ -2132,16 +2143,30 @@ class DouyinLiveChecker:
                         f"(url={_final_url[:80]}, body_len={len(resp.text or '')})",
                         state="douyin_cookie_expired",
                     )
-                    # Fall through to return last known status — don't
-                    # report OFFLINE when we can't actually tell.
+
+                    # If the cookie has been expired beyond the grace period,
+                    # force OFFLINE so a real stream-end doesn't get lost.
+                    if elapsed > self._COOKIE_EXPIRY_GRACE_SECONDS:
+                        logger.error(
+                            f"[CheckStatus] Cookie expired for {elapsed:.0f}s "
+                            f"(grace={self._COOKIE_EXPIRY_GRACE_SECONDS}s) — "
+                            f"forcing OFFLINE to avoid missing stream-end"
+                        )
+                        self._cookie_expired_since = None
+                        return {"room_status": self.STATUS_OFFLINE}
+
+                    # Otherwise return cached status to avoid false offline
                     last = getattr(self, '_last_status', None)
                     if last:
                         logger.warning(
                             f"[CheckStatus] Returning last known status "
-                            f"({last}) — cookie may be expired"
+                            f"({last}) — cookie expired {elapsed:.0f}s ago"
                         )
                         return {"room_status": last}
                     return {"room_status": self.STATUS_OFFLINE}
+
+                # Cookie was valid (not redirected to login) — reset expiry timer
+                self._cookie_expired_since = None
 
                 ttwid = ""
                 if 'ttwid' in resp.cookies:
@@ -2320,6 +2345,44 @@ class WeiboPoster:
 
     def __init__(self, web_cookie: str):
         self.web_cookie = web_cookie
+
+    def check_validity(self) -> bool:
+        """Verify the Weibo cookie is still valid by hitting weibo.com/login.
+
+        A working cookie loads the page normally; an expired cookie redirects
+        to passport/login.  Returns True if the cookie is valid.
+        """
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/138.0.0.0 Safari/537.36"
+            ),
+            "Cookie": self.web_cookie,
+        }
+        try:
+            resp = requests.get(
+                "https://weibo.com/login",
+                headers=headers,
+                allow_redirects=True,
+                timeout=15,
+            )
+            final_url = resp.url or ""
+            if "passport" in final_url or "login" in final_url:
+                logger.warning(
+                    f"[WeiboPoster] Cookie INVALID — redirected to {final_url[:80]}"
+                )
+                return False
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[WeiboPoster] Cookie check failed: HTTP {resp.status_code}"
+                )
+                return False
+            logger.debug("[WeiboPoster] Cookie is valid")
+            return True
+        except Exception as e:
+            logger.warning(f"[WeiboPoster] Cookie check error: {e}")
+            return False
 
     def post_tweet(self, content: str, max_retries: int = 3) -> bool:
         # Remove emoji characters before posting to Weibo
@@ -2664,15 +2727,21 @@ class StreamMonitor:
             mgr = CookieManager()
             data = mgr.load()
             new_cookie = data.get('cookie_str', '')
-            if new_cookie and new_cookie != self.dy_cookie_str:
-                logger.info(f"[CookieReload] Refreshing Douyin cookie "
-                            f"(health={data.get('health', 'unknown')}, "
-                            f"refresh_count={data.get('refresh_count', 0)})")
-                self.dy_cookie_str = new_cookie
-                self.checker.cookie = DouyinLiveChecker._parse_cookie(new_cookie)
-                if self.stats_recorder and self.stats_recorder.is_running():
-                    self.stats_recorder.cookie_str = new_cookie
-                reloaded_any = True
+            if new_cookie != self.dy_cookie_str:
+                if not new_cookie:
+                    logger.warning(
+                        f"[CookieReload] Douyin cookie JSON has empty cookie_str — "
+                        f"keeping current cookie"
+                    )
+                else:
+                    logger.info(f"[CookieReload] Refreshing Douyin cookie "
+                                f"(health={data.get('health', 'unknown')}, "
+                                f"refresh_count={data.get('refresh_count', 0)})")
+                    self.dy_cookie_str = new_cookie
+                    self.checker.cookie = DouyinLiveChecker._parse_cookie(new_cookie)
+                    if self.stats_recorder and self.stats_recorder.is_running():
+                        self.stats_recorder.cookie_str = new_cookie
+                    reloaded_any = True
         except Exception as e:
             logger.warning(f"[CookieReload] Douyin cookie reload failed: {e}")
 
@@ -2682,12 +2751,18 @@ class StreamMonitor:
             wmgr = WeiboCookieManager()
             wdata = wmgr.load()
             new_weibo = wdata.get('cookie_str', '')
-            if new_weibo and new_weibo != self.poster.web_cookie:
-                logger.info(f"[CookieReload] Refreshing Weibo cookie "
-                            f"(health={wdata.get('health', 'unknown')}, "
-                            f"refresh_count={wdata.get('refresh_count', 0)})")
-                self.poster.web_cookie = new_weibo
-                reloaded_any = True
+            if new_weibo != self.poster.web_cookie:
+                if not new_weibo:
+                    logger.warning(
+                        f"[CookieReload] Weibo cookie JSON has empty cookie_str — "
+                        f"keeping current cookie"
+                    )
+                else:
+                    logger.info(f"[CookieReload] Refreshing Weibo cookie "
+                                f"(health={wdata.get('health', 'unknown')}, "
+                                f"refresh_count={wdata.get('refresh_count', 0)})")
+                    self.poster.web_cookie = new_weibo
+                    reloaded_any = True
         except Exception as e:
             logger.warning(f"[CookieReload] Weibo cookie reload failed: {e}")
 
@@ -2795,7 +2870,11 @@ class StreamMonitor:
             logger.info(f"[DRY-RUN] Would post live notification:\n{content}")
             success = True
         else:
-            success = self.poster.post_tweet(content)
+            if not self.poster.check_validity():
+                logger.error("Weibo cookie invalid — skipping live notification")
+                success = False
+            else:
+                success = self.poster.post_tweet(content)
         self.log_notification("live_start", content, success)
 
     def handle_offline(self, room_info: dict = None):
@@ -3068,7 +3147,11 @@ class StreamMonitor:
             logger.info(f"[DRY-RUN] Would post offline summary:\n{content}")
             success = True
         else:
-            success = self.poster.post_tweet(content)
+            if not self.poster.check_validity():
+                logger.error("Weibo cookie invalid — skipping offline summary")
+                success = False
+            else:
+                success = self.poster.post_tweet(content)
         self.log_notification("live_end", content, success)
 
         # Stop the recorder — sets _stop_event (kills background threads)
@@ -3415,6 +3498,31 @@ def main():
 
     args = parser.parse_args()
     config = load_env_config()
+
+    # Override with values from shared cookie JSON files (refresher output)
+    # so the monitor picks up fresh cookies immediately — no need to wait
+    # for the first _reload_cookies() call (5-min cooldown).
+    if not args.dy_cookie:
+        try:
+            from cookie_manager import CookieManager
+            _dy_data = CookieManager().load()
+            _dy_json = _dy_data.get('cookie_str', '')
+            if _dy_json:
+                config['DY_LIVE_COOKIES'] = _dy_json
+                logger.info("Loaded Douyin cookie from cookies.json at startup")
+        except Exception as e:
+            logger.debug(f"Could not load Douyin cookie from JSON: {e}")
+
+    if not args.weibo_cookie:
+        try:
+            from weibo_cookie_manager import WeiboCookieManager
+            _wb_data = WeiboCookieManager().load()
+            _wb_json = _wb_data.get('cookie_str', '')
+            if _wb_json:
+                config['WEIBO_COOKIE'] = _wb_json
+                logger.info("Loaded Weibo cookie from weibo_cookies.json at startup")
+        except Exception as e:
+            logger.debug(f"Could not load Weibo cookie from JSON: {e}")
 
     dy_cookie = args.dy_cookie or config['DY_LIVE_COOKIES'] or config['DY_COOKIES']
     weibo_cookie = args.weibo_cookie or config['WEIBO_COOKIE']

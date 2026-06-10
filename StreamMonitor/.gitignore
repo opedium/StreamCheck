@@ -3,6 +3,9 @@
 
 # Notification log
 notification_log.json
+notification_log.csv
+
+
 
 # Loguru log files
 logs/
@@ -15,7 +18,13 @@ __pycache__/
 
 # Cookie state (auto-generated, contains secrets)
 cookies.json
+weibo_cookies.json
+bilibili_cookies.json
 
 # Playwright persistent browser profile (large, auto-generated)
 browser_profile/
 
+.venv/
+.docs/
+
+%userprofile%/AppData/Local/Microsoft/Edge/User Data/Default/Cookies
