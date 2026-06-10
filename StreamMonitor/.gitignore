@@ -1,47 +1,21 @@
-# ── Secrets / credentials ────────────────────────────────────────────
+# Environment config (contains secrets)
 .env
-.env.*
-*.bak
-*.bak2
-cookies.json
-weibo_cookies.json
-bilibili_cookies.json
 
-# ── Runtime data (regenerated each stream) ───────────────────────────
-live_stats.json
-live_stats_reconstructed.json
-stats_timeseries.csv
-seed_override.json
-
-# ── Notification logs ────────────────────────────────────────────────
-notification_log.csv
+# Notification log
 notification_log.json
 
-# ── Python cache ─────────────────────────────────────────────────────
+# Loguru log files
+logs/
+*.log
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 
-# ── Log files ────────────────────────────────────────────────────────
-logs/
-*.log
-*.log.*
-streammonitor.log
+# Cookie state (auto-generated, contains secrets)
+cookies.json
 
-# ── One-off patches (already integrated into main.py) ────────────────
-fix_follower.py
-fix_follower2.py
-main.py.bak
-main.py.bak2
-
-# ── Browser profiles (large, auto-generated) ─────────────────────────
+# Playwright persistent browser profile (large, auto-generated)
 browser_profile/
-*_browser_profile/
-chromium-data/
 
-# ── System / OS ──────────────────────────────────────────────────────
-Thumbs.db
-.DS_Store
-*.swp
-*.swo
-*~
