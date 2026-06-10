@@ -156,6 +156,33 @@ def add_cors_headers(response):
 
 # ── Routes ──────────────────────────────────────────────────────────
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Login page — only rendered when auth is enabled.
+
+    On POST, validates STREAM_WEB_USERNAME/PASSWORD and sets session['auth'].
+    Redirects to / on success, re-renders with error on failure.
+    """
+    if not _WEB_AUTH_ENABLED:
+        return redirect(url_for("index"))
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if username == _WEB_USERNAME and password == _WEB_PASSWORD:
+            session["auth"] = True
+            session.permanent = True
+            return redirect(url_for("index"))
+        return render_template("login.html", error="Invalid credentials"), 401
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    """Clear the auth session."""
+    session.pop("auth", None)
+    return redirect(url_for("login") if _WEB_AUTH_ENABLED else url_for("index"))
+
+
 @app.route("/")
 def index():
     """Serve the HTML health check page."""
@@ -247,13 +274,15 @@ def api_status():
         monitor_running = None
 
     # Load notification log for recent activity
-    log_path = os.path.join(os.path.dirname(__file__), "notification_log.json")
+    # File was migrated from JSON to CSV by main.py — read CSV format.
+    log_path = os.path.join(os.path.dirname(__file__), "notification_log.csv")
     recent_events = []
     try:
         if os.path.exists(log_path):
+            import csv
             with open(log_path, "r", encoding="utf-8") as f:
-                all_events = json.load(f)
-            recent_events = all_events[-10:]  # Last 10 events
+                rows = list(csv.DictReader(f))
+            recent_events = rows[-10:]  # Last 10 events
     except Exception:
         pass
 

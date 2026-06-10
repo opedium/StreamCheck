@@ -51,6 +51,18 @@ class WeiboCookieRefresher:
         old_cookie_str = data.get("cookie_str", "")
         profile_dir = os.path.join(_SCRIPT_DIR, "weibo_browser_profile")
 
+        # Fast path: if existing cookie is already valid, skip browser entirely.
+        # This avoids the risk of Weibo's server overwriting session cookies
+        # during navigation (a known issue with the browser profile approach).
+        if old_cookie_str:
+            is_valid = await self._test_cookie(old_cookie_str)
+            if is_valid:
+                print(
+                    f"[WeiboCookieRefresher] Existing cookie valid — skipping browser",
+                    flush=True,
+                )
+                return True, True
+
         print(
             f"[WeiboCookieRefresher] Starting refresh cycle "
             f"(profile={profile_dir}, cookie_len={len(old_cookie_str)})",
@@ -178,24 +190,31 @@ class WeiboCookieRefresher:
                     flush=True,
                 )
 
-                # ── Save ───────────────────────────────────────────────
-                self.manager.save(
-                    {
-                        "cookie_str": new_cookie_str,
-                        "health": "ok" if has_sub else "degraded",
-                        "refresh_count": data.get("refresh_count", 0) + 1,
-                    }
-                )
-
-                # ── Test the refreshed cookie with a live API call ────
+                # ── Test before save ──────────────────────────────────
+                # Only overwrite the cookie file if the extracted cookies
+                # actually work. If test fails, keep the previous (working)
+                # cookie intact.
                 test_ok = await self._test_cookie(new_cookie_str)
 
-                print(
-                    f"[WeiboCookieRefresher] Refresh SUCCESS "
-                    f"(#{data.get('refresh_count', 0) + 1}) "
-                    f"test={'PASS' if test_ok else 'FAIL'}",
-                    flush=True,
-                )
+                if test_ok:
+                    self.manager.save(
+                        {
+                            "cookie_str": new_cookie_str,
+                            "health": "ok",
+                            "refresh_count": data.get("refresh_count", 0) + 1,
+                        }
+                    )
+                    print(
+                        f"[WeiboCookieRefresher] Refresh SUCCESS "
+                        f"(#{data.get('refresh_count', 0) + 1}) test=PASS",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[WeiboCookieRefresher] Extracted cookies FAILED test — "
+                        f"keeping previous working cookie",
+                        flush=True,
+                    )
                 return True, test_ok
 
         except Exception as e:
@@ -207,10 +226,13 @@ class WeiboCookieRefresher:
             return False, False
 
     async def _test_cookie(self, cookie_str: str) -> bool:
-        """Test a cookie string against Weibo's homepage.
+        """Test a cookie string against weibo.com.
 
-        A working cookie loads the homepage without redirecting to login.
-        Returns True if the cookie passes, False otherwise.
+        Uses the desktop site (same domain where posts go) rather than the
+        mobile API (m.weibo.cn/api/config), which can reject valid cookies
+        that work fine on the desktop site.
+
+        Returns True if the cookie is valid (not redirected to passport/visitor).
         """
         import requests as _r
         try:
@@ -219,32 +241,28 @@ class WeiboCookieRefresher:
                 "Cookie": cookie_str,
             }
             resp = _r.get(
-                "https://weibo.com/login",
+                "https://weibo.com",
                 headers=headers,
-                allow_redirects=True,
                 timeout=15,
+                allow_redirects=True,
             )
-            final_url = resp.url or ""
-            if "passport" in final_url or "login" in final_url:
+            is_valid = (
+                "passport.weibo.com" not in resp.url
+                and "visitor" not in resp.url.lower()
+            )
+
+            if is_valid:
                 print(
-                    f"[WeiboCookieRefresher] Test FAILED: "
-                    f"redirected to {final_url[:80]}",
+                    f"[WeiboCookieRefresher] Test PASSED: on weibo.com",
                     flush=True,
                 )
-                return False
-            if resp.status_code != 200:
+            else:
                 print(
                     f"[WeiboCookieRefresher] Test FAILED: "
-                    f"HTTP {resp.status_code}",
+                    f"redirected to {resp.url[:80]}",
                     flush=True,
                 )
-                return False
-            print(
-                f"[WeiboCookieRefresher] Test PASSED: "
-                f"status={resp.status_code}, url={final_url[:60]}",
-                flush=True,
-            )
-            return True
+            return is_valid
         except Exception as e:
             print(
                 f"[WeiboCookieRefresher] Test ERROR: {e}",
