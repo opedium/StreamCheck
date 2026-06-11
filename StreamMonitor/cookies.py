@@ -694,12 +694,17 @@ class UnifiedCookieRefresher:
                     )
 
                 # Stash info for Telegram notification
+                old_str = prev_data.get("cookie_str", "")
                 self._refresh_info = {
                     "cookie_count": len(new_cookies),
                     "missing": missing,
                     "new_cookie_str": new_cookie_str,
-                    "sub_renewed": self._detect_sub_renewal(
-                        new_cookie_str, prev_data.get("cookie_str", "")
+                    "critical_changed": self._detect_critical_change(
+                        new_cookie_str, old_str, self.cfg["critical_cookies"]
+                    ),
+                    "odin_tt_changed": (
+                        extract_cookie_value(new_cookie_str, "odin_tt")
+                        != extract_cookie_value(old_str, "odin_tt")
                     ),
                 }
 
@@ -820,11 +825,33 @@ class UnifiedCookieRefresher:
         return "  ".join(parts)
 
     @staticmethod
-    def _detect_sub_renewal(new_cookie_str: str, old_cookie_str: str) -> bool:
-        """Return ``True`` if the SUB cookie value changed (session renewed)."""
-        old_sub = extract_cookie_value(old_cookie_str, "SUB")
-        new_sub = extract_cookie_value(new_cookie_str, "SUB")
-        return bool(new_sub and new_sub != old_sub)
+    def _detect_critical_change(
+        new_cookie_str: str, old_cookie_str: str, critical_keys: list[str]
+    ) -> list[str]:
+        """Return list of critical cookies whose value changed (session renewed)."""
+        changed = []
+        for key in critical_keys:
+            old_val = extract_cookie_value(old_cookie_str, key)
+            new_val = extract_cookie_value(new_cookie_str, key)
+            if new_val and new_val != old_val:
+                changed.append(key)
+        return changed
+
+    def _fmt_extra_cookies(self, cookie_str: str) -> str:
+        """Platform-specific extra cookie status (e.g. ttwid, odin_tt for douyin)."""
+        if self.platform == "douyin":
+            ttwid = extract_cookie_value(cookie_str, "ttwid")
+            odin = extract_cookie_value(cookie_str, "odin_tt")
+            sessionid = extract_cookie_value(cookie_str, "sessionid")
+            parts = []
+            if ttwid:
+                parts.append("ttwid ✅")
+            if odin:
+                parts.append("odin_tt ✅")
+            if sessionid:
+                parts.append("sessionid ✅")
+            return "  ".join(parts)
+        return ""
 
     def _format_refresh_msg(
         self,
@@ -850,16 +877,29 @@ class UnifiedCookieRefresher:
         ck = self._fmt_cookies_list(
             ri.get("new_cookie_str", ""), self.cfg["critical_cookies"]
         )
+        extra = self._fmt_extra_cookies(ri.get("new_cookie_str", ""))
         count = ri.get("cookie_count", 0)
-        renewed = ri.get("sub_renewed", False)
+        critical_changed = ri.get("critical_changed", [])
+        odin_changed = ri.get("odin_tt_changed", False)
 
         icon = "🟢" if test_ok else "🟡"
-        renewed_tag = " SUB renewed" if renewed else ""
+
+        # Build session-renewed tags
+        renewed_tags = []
+        for k in critical_changed:
+            renewed_tags.append(f"{k} renewed")
+        if odin_changed and self.platform == "douyin":
+            renewed_tags.append("odin_tt rotated")
+        if self.platform == "weibo" and "SUB" in critical_changed:
+            renewed_tags.append("SUB renewed")
+        renewed_tag = " | " + " | ".join(renewed_tags) if renewed_tags else ""
+
         expiry_line = f"\n  Expires: {expiry}" if expiry else ""
+        extra_line = f"\n  Extras: {extra}" if extra else ""
 
         return (
             f"{icon} {self.platform} refreshed{renewed_tag} [{ts}]\n"
-            f"  Cookies: {count} ({ck}){expiry_line}"
+            f"  Cookies: {count} ({ck}){extra_line}{expiry_line}"
         )
 
     def _clean_profile(self):
