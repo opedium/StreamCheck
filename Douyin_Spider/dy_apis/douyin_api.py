@@ -746,33 +746,79 @@ class DouyinAPI:
     def get_live_info(auth_, live_id, **kwargs):
         """
         获取直播间信息.
+        Uses /webcast/room/web/enter/ API (same as the SPA), with legacy
+        HTML page fetch as fallback for ttwid cookie.
         :param live_id: 直播间ID
         :return: dict with keys (room_id, user_id, sec_uid, ...) or None on failure.
         """
-        url = "https://live.douyin.com/" + live_id
-        headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "accept-language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.7,ja;q=0.6",
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
-            "priority": "u=0, i",
-            "referer": "https://live.douyin.com/?from_nav=1",
-            "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Windows\"",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "upgrade-insecure-requests": "1",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-        }
-        res = requests.get(url, headers=headers, cookies=auth_.cookie, verify=False)
-        ttwid = res.cookies.get_dict().get('ttwid', '')
-        parsed = parse_douyin_live_page(res.text)
-        if parsed is None:
+        # Strategy 1: /webcast/room/web/enter/ API (same as SPA)
+        try:
+            params = {
+                'aid': '6383', 'app_name': 'douyin_web', 'live_id': '1',
+                'device_platform': 'web', 'language': 'zh-CN',
+                'enter_from': 'link_share', 'cookie_enabled': 'true',
+                'screen_width': '1280', 'screen_height': '720',
+                'browser_language': 'zh-CN', 'browser_platform': 'Win32',
+                'browser_name': 'Chrome', 'browser_version': '143.0.0.0',
+                'browser_online': 'true', 'tz_name': 'Asia/Shanghai',
+                'web_rid': live_id,
+            }
+            resp = requests.get(
+                'https://live.douyin.com/webcast/room/web/enter/',
+                params=params, cookies=auth_.cookie,
+                headers={
+                    'Accept': 'application/json',
+                    'Referer': f'https://live.douyin.com/{live_id}',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                verify=False, timeout=15
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                room = (data or {}).get('data', {}).get('data', [None])[0]
+                user = (data or {}).get('data', {}).get('user', {})
+                if room is not None:
+                    # Also fetch page for ttwid cookie
+                    ttwid = ''
+                    try:
+                        html_resp = requests.get(
+                            f'https://live.douyin.com/{live_id}',
+                            cookies=auth_.cookie, verify=False, timeout=10
+                        )
+                        ttwid = html_resp.cookies.get_dict().get('ttwid', '')
+                    except Exception:
+                        pass
+                    return {
+                        "room_id": str(room.get('id_str', '')),
+                        "user_id": str(user.get('id_str', '')),
+                        "user_unique_id": str(user.get('id_str', '')),
+                        "anchor_id": str(user.get('id_str', '')),
+                        "sec_uid": user.get('sec_uid', ''),
+                        "ttwid": ttwid,
+                        "room_status": str(room.get('status', '4')),
+                        "room_title": room.get('title', ''),
+                        "anchor_nickname": user.get('nickname', ''),
+                    }
+        except Exception:
+            pass
+
+        # Strategy 2: Legacy HTML page fetch (for ttwid only)
+        try:
+            headers = {
+                "accept": "text/html,*/*",
+                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+            res = requests.get(f"https://live.douyin.com/{live_id}",
+                               headers=headers, cookies=auth_.cookie, verify=False, timeout=10)
+            ttwid = res.cookies.get_dict().get('ttwid', '')
+            return {
+                "room_id": "", "user_id": "", "user_unique_id": "",
+                "anchor_id": "", "sec_uid": "",
+                "ttwid": ttwid,
+                "room_status": "4", "room_title": "", "anchor_nickname": "",
+            }
+        except Exception:
             return None
-        parsed['ttwid'] = ttwid
-        return parsed
 
     @staticmethod
     def get_live_production(auth, url: str, room_id: str, author_id: str, offset: str, **kwargs):
@@ -1899,152 +1945,6 @@ class DouyinAPI:
         search_id = resp.headers["X-Tt-Logid"]
         json_data = resp.json()
         return search_id, json_data["guide_search_words"], json_data
-
-
-# ======================================================================
-# Shared HTML page parser — used by both DouyinAPI.get_live_info() and
-# DouyinLiveChecker.check_status() (in StreamMonitor/main.py).
-# Tries 3 strategies in order:
-#   1. script[nonce] regex (fast)
-#   2. RENDER_DATA JSON blob (stable)
-#   3. __INITIAL_STATE__ JSON blob (legacy fallback)
-# ======================================================================
-
-def parse_douyin_live_page(html: str) -> dict | None:
-    """
-    Parse a live.douyin.com HTML page and extract room/anchor info.
-
-    Returns a dict with keys: room_id, user_id, sec_uid, room_status,
-    room_title, anchor_nickname, follower_count.
-    Returns None if all parsing strategies fail.
-    """
-    from bs4 import BeautifulSoup
-    import urllib.parse
-
-    soup = BeautifulSoup(html, 'html.parser')
-    scripts = soup.select('script[nonce]')
-
-    # Strategy 1: script[nonce] regex parsing (fast, covers most cases)
-    for script in scripts:
-        if script.string is None or 'roomId' not in script.string:
-            continue
-        try:
-            user_id = re.findall(r'\\"user_unique_id\\":\\"(\d+)\\"', script.string)[0]
-            room_id = re.findall(r'\\"roomId\\":\\"(\d+)\\"', script.string)[0]
-            anchor_id = re.findall(r'\\"anchor\\":\{\\"id_str\\":\\"(\d+)\\"', script.string)[0]
-            sec_uid = re.findall(r'\\"sec_uid\\":\\"(.*?)\\"', script.string)[0]
-            room_info = re.findall(
-                r'\\"roomInfo\\":\{\\"room\\":\{\\"id_str\\":\\".*?\\",\\"status\\":(.*?),\\"status_str\\":\\".*?\\",\\"title\\":\\"(.*?)\\"',
-                script.string,
-            )
-            anchor_nickname = ""
-            anchor_nickname_match = re.search(
-                r'\\"anchor\\":\{.*?\\"nickname\\":\\"(.*?)\\"', script.string
-            )
-            if anchor_nickname_match:
-                anchor_nickname = anchor_nickname_match.group(1)
-            # Extract followerCount from script[nonce] blob
-            follower_count = 0
-            fc_match = re.search(r'\\"followerCount\\":(\d+)', script.string)
-            if fc_match:
-                follower_count = int(fc_match.group(1))
-
-            room_status = room_info[0][0] if room_info else "4"
-            room_title = room_info[0][1] if room_info else ""
-
-            return {
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_unique_id": user_id,
-                "anchor_id": anchor_id,
-                "sec_uid": sec_uid,
-                "room_status": room_status,
-                "room_title": room_title,
-                "anchor_nickname": anchor_nickname,
-                "follower_count": follower_count,
-            }
-        except Exception:
-            continue
-
-    # Strategy 2: RENDER_DATA JSON blob (stable, survives HTML restructuring)
-    render_data_match = re.search(
-        r'<script[^>]*id="RENDER_DATA"[^>]*>(.*?)</script>', html, re.DOTALL
-    )
-    if render_data_match:
-        try:
-            raw = render_data_match.group(1)
-            decoded = urllib.parse.unquote(raw)
-            render_json = json.loads(decoded)
-            room_data = (render_json.get('app', {})
-                         .get('initialState', {})
-                         .get('roomStore', {})
-                         .get('roomInfo', {})
-                         .get('room', {}))
-            if room_data:
-                anchor_info = room_data.get('anchor', {})
-                follower_count = 0
-                fc_raw = anchor_info.get('followerCount', 0)
-                if fc_raw:
-                    if isinstance(fc_raw, str):
-                        follower_count = int(float(fc_raw.replace('万', '')) * 10000) if '万' in fc_raw else int(float(fc_raw))
-                    else:
-                        follower_count = int(fc_raw)
-                return {
-                    "room_id": str(room_data.get('id_str', '')),
-                    "user_id": str(anchor_info.get('id_str', '')),
-                    "user_unique_id": str(anchor_info.get('id_str', '')),
-                    "anchor_id": str(anchor_info.get('id_str', '')),
-                    "sec_uid": anchor_info.get('sec_uid', ''),
-                    "room_status": str(room_data.get('status', '4')),
-                    "room_title": room_data.get('title', ''),
-                    "anchor_nickname": anchor_info.get('nickname', ''),
-                    "follower_count": follower_count,
-                }
-        except Exception:
-            pass
-
-    # Strategy 3: __INITIAL_STATE__ JSON blob (legacy fallback)
-    init_start = html.find('window.__INITIAL_STATE__')
-    if init_start != -1:
-        try:
-            eq_pos = html.find('=', init_start)
-            brace_start = html.find('{', eq_pos)
-            if brace_start != -1:
-                depth = 1
-                pos = brace_start + 1
-                while depth > 0 and pos < len(html):
-                    if html[pos] == '{':
-                        depth += 1
-                    elif html[pos] == '}':
-                        depth -= 1
-                    pos += 1
-                json_str = html[brace_start:pos]
-                init_json = json.loads(json_str)
-                room = init_json.get('roomInfo', {}).get('room', {})
-                if room:
-                    anchor = room.get('anchor', {})
-                    follower_count = 0
-                    fc_raw = anchor.get('followerCount', 0)
-                    if fc_raw:
-                        if isinstance(fc_raw, str):
-                            follower_count = int(float(fc_raw.replace('万', '')) * 10000) if '万' in fc_raw else int(float(fc_raw))
-                        else:
-                            follower_count = int(fc_raw)
-                    return {
-                        "room_id": str(room.get('id_str', '')),
-                        "user_id": str(anchor.get('id_str', '')),
-                        "user_unique_id": str(anchor.get('id_str', '')),
-                        "anchor_id": str(anchor.get('id_str', '')),
-                        "sec_uid": anchor.get('sec_uid', ''),
-                        "room_status": str(room.get('status', '4')),
-                        "room_title": room.get('title', ''),
-                        "anchor_nickname": anchor.get('nickname', ''),
-                        "follower_count": follower_count,
-                    }
-        except Exception:
-            pass
-
-    return None
 
 
 if __name__ == '__main__':
