@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import traceback
 from datetime import datetime
 from typing import Optional
@@ -509,6 +510,7 @@ class UnifiedCookieRefresher:
         self.keepalive = KeepaliveChecker(platform)
         self.notifier = notifier
         self._refresh_info: dict = {}  # populated by _browser_refresh
+        self._last_keepalive_notify: float = 0  # epoch seconds, for rate-limiting
 
     # ── public entry point ──────────────────────────────────────────
 
@@ -531,6 +533,18 @@ class UnifiedCookieRefresher:
                     f"[{self.platform}] Cookie still valid — skipping browser",
                     flush=True,
                 )
+                # Notify at most once per 24h so user knows the refresher
+                # is alive even when no work is needed
+                if self.notifier and (
+                    time.time() - self._last_keepalive_notify > 86400
+                ):
+                    self._last_keepalive_notify = time.time()
+                    self.notifier.send(
+                        self._format_refresh_msg(
+                            True, True, method="keepalive"
+                        ),
+                        state=None,
+                    )
                 return True, True
 
         # Layer 2 — browser refresh
