@@ -107,6 +107,15 @@ except Exception as e:
     HAS_LIVE_DETAILS = False
 
 
+# WebSocket fallback hosts for Douyin live streams.
+# If the primary (-hl = high-load) host is unreachable, secondary hosts
+# are tried in order via _test_wss_host() before run_forever().
+WSS_HOSTS = [
+    "wss://webcast100-ws-web-hl.douyin.com/webcast/im/push/v2/",
+    "wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/",
+]
+
+
 def safe_print(*args, **kwargs):
     """Print that survives closed stdout (e.g., PM2 log rotation).
 
@@ -605,6 +614,23 @@ class LiveStatsRecorder:
         return max(getattr(self, 'current_viewers', 0), 0)
 
     @staticmethod
+    def _test_wss_host(host: str) -> bool:
+        """Quick TCP-level connectivity test for a WSS host.
+
+        Performs a non-blocking socket connect with 3-second timeout.
+        This is NOT a full WebSocket handshake — just checks if the
+        host:port is reachable.
+        """
+        import socket as _socket
+        try:
+            hostname = host.split("://")[1].split("/")[0]
+            sock = _socket.create_connection((hostname, 443), timeout=3)
+            sock.close()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def _clear_csv_if_new_stream():
         """Clear CSV if last row is >2 hours old — this is a new stream,
         not a crash recovery.  Keeps the file clean across streams."""
@@ -934,9 +960,12 @@ class LiveStatsRecorder:
                             self.http_follow_last = fc_int
                         if self.verbose:
                             logger.info(f"[HTTP Follow] http_follow_first={fc_int:,} (first this session)")
-                    # Track the anchor's actual total follower count (authoritative)
-                    # Direct assignment (not max) so real follower losses are reflected.
-                    self.follower_count = fc_int
+                    # Track the anchor's actual total follower count (authoritative).
+                    # Use smoothing to reject ±1% API noise while accepting real losses.
+                    if fc_int > 0:
+                        _min_acceptable = int(self.follower_count * 0.99)
+                        if fc_int >= _min_acceptable or fc_int > self.follower_count:
+                            self.follower_count = fc_int
                     if fc_int > self.http_follow_last:
                         self.http_follow_last = fc_int
                         if self.verbose:
@@ -1053,7 +1082,17 @@ class LiveStatsRecorder:
          .add_param('heartbeatDuration', '0')
          .add_param('signature', generate_signature(room_id, user_id))
         )
-        wss_url = f"wss://webcast100-ws-web-hl.douyin.com/webcast/im/push/v2/?{urlencode(params.get())}"
+        # Build WSS URL from primary host, with fallback if unreachable
+        primary_host = WSS_HOSTS[0]
+        wss_url = f"{primary_host}?{urlencode(params.get())}"
+        if not self._test_wss_host(primary_host):
+            for fallback_host in WSS_HOSTS[1:]:
+                if self._test_wss_host(fallback_host):
+                    logger.warning(f"[WSS] Primary host unreachable, using fallback: {fallback_host}")
+                    wss_url = f"{fallback_host}?{urlencode(params.get())}"
+                    break
+            else:
+                logger.warning("[WSS] All fallback hosts unreachable — trying primary anyway (network may recover)")
 
         self.ws = WebSocketApp(
             url=wss_url,
@@ -1834,6 +1873,11 @@ class LiveStatsRecorder:
                     MAX_DISPLAY_LONG = 1440  # ~1 hour at 2.5s intervals
                     if len(self.display_long_history) > MAX_DISPLAY_LONG:
                         self.display_long_history = self.display_long_history[-MAX_DISPLAY_LONG:]
+                    # SOURCE 1: RoomStatsMessage.displayValue — Douyin's "official"
+                    # concurrent viewer count from the stats message.  Arrives every
+                    # ~2-3 seconds.  See ALSO SOURCE 2 at RoomUserSeqMessage field 3
+                    # which provides the same value from a different message type.
+                    # Both should agree within ~20%; divergence triggers a warning.
                     self.current_viewers = msg.displayValue
                     self._last_viewer_update = datetime.now()
                     current_viewers = self.current_viewers
@@ -1919,9 +1963,25 @@ class LiveStatsRecorder:
                     # Parse RoomUserSeqMessage to extract field 3 (current online viewers)
                     # and field 11 (cumulative views).  Field 3 is the actual viewer count
                     # that Douyin's own UI uses — more accurate than RoomStatsMessage.
+                    # SOURCE 2: RoomUserSeqMessage field 3 — concurrent viewer count
+                    # from the user-sequence message.  Complement to SOURCE 1
+                    # (RoomStatsMessage.displayValue).  Both should agree within
+                    # ~20%; divergence triggers a warning.
                     try:
                         online_now, cum_views = parse_room_user_seq_msg(payload)
                         if online_now > 0:
+                            # ── Divergence check ──────────────────────────
+                            _prev_viewers = getattr(self, 'current_viewers', 0)
+                            if _prev_viewers > 0:
+                                _max_v = max(online_now, _prev_viewers)
+                                _diff = abs(online_now - _prev_viewers) / _max_v
+                                if _diff > 0.20:
+                                    logger.warning(
+                                        f"[VIEWER-DIVERGENCE] "
+                                        f"RoomStats={_prev_viewers:,} vs "
+                                        f"RoomUserSeq={online_now:,} "
+                                        f"(diff={_diff:.1%})"
+                                    )
                             self.current_viewers = online_now
                             self._last_viewer_update = datetime.now()
                             if online_now > self.peak_viewers:
@@ -2160,11 +2220,26 @@ class LiveStatsRecorder:
                 logger.debug(f"[FollowerRefresh] Skipped 万-rounded value: {fc:,.0f}")
                 return
             fc_int = int(fc)
-            # Track latest API value as the authoritative follower count
-            # (NOT max() — max would freeze at yesterday's peak and never
-            # reflect real follower losses or API refreshes).
-            self.follower_count = fc_int
-            # Track highest seen separately for peak analysis
+            # ── Follower count smoothing ──────────────────────────────────
+            # The Douyin API fluctuates ±20-30 between calls (cache/server
+            # differences).  Direct assignment makes http_delta dip on every
+            # refresh.  Use a "decaying max" approach:
+            #   - Accept any value >= 99% of current (tolerates ±1% noise)
+            #   - Accept any value > current (monotonic growth)
+            #   - Reject small drops <= 1% (API noise, not real)
+            #   - Reject 0 (API failure — keep last known value)
+            _FOLLOWER_SMOOTHING_THRESHOLD = 0.99
+            if fc_int > 0:
+                _min_acceptable = int(self.follower_count * _FOLLOWER_SMOOTHING_THRESHOLD)
+                if fc_int >= _min_acceptable or fc_int > self.follower_count:
+                    self.follower_count = fc_int
+                elif self.verbose:
+                    logger.debug(
+                        f"[FollowerRefresh] Rejected small drop: "
+                        f"{fc_int:,} < threshold {_min_acceptable:,} "
+                        f"(current={self.follower_count:,})"
+                    )
+            # Track highest seen separately for peak analysis (no smoothing)
             if fc_int > self.http_follow_last:
                 self.http_follow_last = fc_int
             if self.verbose:
@@ -2353,6 +2428,26 @@ class DouyinLiveChecker:
                 result[k.strip()] = v.strip()
         return result
 
+    @staticmethod
+    def _parse_follower_count(anchor_info: dict) -> int:
+        """Extract and normalize followerCount from an anchor info dict.
+        Handles integer, float, and Chinese-number string formats.
+        Returns 0 if unparseable or missing.
+        """
+        fc = anchor_info.get('followerCount', 0)
+        if not fc:
+            return 0
+        if isinstance(fc, str):
+            if '万' in fc:
+                return int(float(fc.replace('万', '')) * 10000)
+            try:
+                return int(float(fc))
+            except (ValueError, TypeError):
+                return 0
+        if isinstance(fc, (int, float)):
+            return int(fc)
+        return 0
+
     def check_status(self) -> dict:
         """Check Douyin stream status with retry logic for timeouts."""
         max_retries = 3
@@ -2470,6 +2565,11 @@ class DouyinLiveChecker:
                             room_status = self.STATUS_OFFLINE
                             room_title = ""
 
+                        # Extract followerCount from script[nonce] blob
+                        _fc = 0
+                        _fc_match = re.search(r'\\"followerCount\\":(\d+)', script.string)
+                        if _fc_match:
+                            _fc = int(_fc_match.group(1))
                         result = {
                             "room_id": room_id,
                             "user_id": user_id,
@@ -2480,6 +2580,7 @@ class DouyinLiveChecker:
                             "room_status": room_status,
                             "room_title": room_title,
                             "anchor_nickname": anchor_nickname,
+                            "follower_count": _fc,
                         }
                         # Cache last known status so timeout fallback can preserve it
                         self._last_status = room_status
@@ -2512,7 +2613,8 @@ class DouyinLiveChecker:
                             sec_uid = anchor_info.get('sec_uid', '')
                             nickname = anchor_info.get('nickname', '')
                             user_id = str(anchor_info.get('id_str', ''))
-                            logger.info(f"[Fallback] RENDER_DATA room: status={status}, title={title}")
+                            follower_count = self._parse_follower_count(anchor_info)
+                            logger.info(f"[Fallback] RENDER_DATA room: status={status}, title={title}, followers={follower_count:,}")
                             return {
                                 "room_id": rid,
                                 "user_id": user_id,
@@ -2523,6 +2625,7 @@ class DouyinLiveChecker:
                                 "room_status": status,
                                 "room_title": title,
                                 "anchor_nickname": nickname,
+                                "follower_count": follower_count,
                             }
                     except Exception as e:
                         logger.debug(f"[Fallback] RENDER_DATA parse failed: {e}")
@@ -2556,7 +2659,8 @@ class DouyinLiveChecker:
                                 sec_uid = anchor.get('sec_uid', '')
                                 nickname = anchor.get('nickname', '')
                                 user_id = str(anchor.get('id_str', ''))
-                                logger.info(f"[Fallback] __INITIAL_STATE__ room: status={status}, title={title}")
+                                follower_count = self._parse_follower_count(anchor)
+                                logger.info(f"[Fallback] __INITIAL_STATE__ room: status={status}, title={title}, followers={follower_count:,}")
                                 return {
                                     "room_id": rid,
                                     "user_id": user_id,
@@ -2567,6 +2671,7 @@ class DouyinLiveChecker:
                                     "room_status": status,
                                     "room_title": title,
                                     "anchor_nickname": nickname,
+                                    "follower_count": follower_count,
                                 }
                     except Exception as e:
                         logger.debug(f"[Fallback] __INITIAL_STATE__ parse failed: {e}")
