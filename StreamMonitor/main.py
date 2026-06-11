@@ -3960,10 +3960,12 @@ def load_env_config():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
     if os.path.exists(env_path):
         load_dotenv(env_path)
+    # NOTE: Cookie values are loaded from JSON files below, NOT from .env.
+    # DY_LIVE_COOKIES, DY_COOKIES, and WEIBO_COOKIE in .env are ignored.
     return {
-        'DY_LIVE_COOKIES': os.getenv('DY_LIVE_COOKIES', ''),
-        'DY_COOKIES': os.getenv('DY_COOKIES', ''),
-        'WEIBO_COOKIE': os.getenv('WEIBO_COOKIE', ''),
+        'DY_LIVE_COOKIES': '',
+        'DY_COOKIES': '',
+        'WEIBO_COOKIE': '',
         'DY_LIVE_ID': os.getenv('DY_LIVE_ID', ''),
         'DY_LIVE_TITLE': os.getenv('DY_LIVE_TITLE', ''),
         'CHECK_INTERVAL': int(os.getenv('CHECK_INTERVAL', '10')),
@@ -3998,9 +4000,7 @@ def main():
     args = parser.parse_args()
     config = load_env_config()
 
-    # Override with values from shared cookie JSON files (refresher output)
-    # so the monitor picks up fresh cookies immediately — no need to wait
-    # for the first _reload_cookies() call (5-min cooldown).
+    # Load cookies from shared JSON files ONLY — .env is NOT used for cookies.
     if not args.dy_cookie:
         try:
             from cookies import CookieManager
@@ -4009,8 +4009,10 @@ def main():
             if _dy_json:
                 config['DY_LIVE_COOKIES'] = _dy_json
                 logger.info("Loaded Douyin cookie from cookies.json at startup")
+            else:
+                logger.error("cookies.json exists but cookie_str is empty")
         except Exception as e:
-            logger.debug(f"Could not load Douyin cookie from JSON: {e}")
+            logger.error(f"Failed to load Douyin cookie from cookies.json: {e}")
 
     if not args.weibo_cookie:
         try:
@@ -4020,8 +4022,10 @@ def main():
             if _wb_json:
                 config['WEIBO_COOKIE'] = _wb_json
                 logger.info("Loaded Weibo cookie from weibo_cookies.json at startup")
+            else:
+                logger.error("weibo_cookies.json exists but cookie_str is empty")
         except Exception as e:
-            logger.debug(f"Could not load Weibo cookie from JSON: {e}")
+            logger.error(f"Failed to load Weibo cookie from weibo_cookies.json: {e}")
 
     dy_cookie = args.dy_cookie or config['DY_LIVE_COOKIES'] or config['DY_COOKIES']
     weibo_cookie = args.weibo_cookie or config['WEIBO_COOKIE']

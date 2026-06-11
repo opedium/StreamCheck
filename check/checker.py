@@ -202,34 +202,31 @@ class WeiboPoster:
 # ======================================================================
 
 def _load_cookie_from_json(json_path: str, env_var: str, label: str) -> str:
-    """Read a cookie string from a shared JSON file, falling back to .env.
+    """Read a cookie string from a shared JSON file ONLY.
 
     The JSON files are written by the StreamMonitor cookie refreshers and
     have the format: ``{"cookie_str": "...", "health": "ok", ...}``.
+    .env fallback has been removed — cookies live exclusively in JSON files.
     """
-    # Try the shared JSON file first (written by cookie refreshers)
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            cookie = (data or {}).get("cookie_str", "")
-            if cookie:
-                logger.info(f"Loaded {label} from {json_path}")
-                return cookie
-            else:
-                logger.warning(f"{json_path} exists but has empty cookie_str — falling back to .env")
-        except (json.JSONDecodeError, IOError) as e:
-            logger.warning(f"Failed to read {json_path}: {e} — falling back to .env")
-
-    # Fall back to .env
-    cookie = os.getenv(env_var, "")
-    if cookie:
-        logger.info(f"Loaded {label} from .env ({env_var})")
-    return cookie
+    if not os.path.exists(json_path):
+        logger.warning(f"{label} file not found: {json_path}")
+        return ""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cookie = (data or {}).get("cookie_str", "")
+        if cookie:
+            logger.info(f"Loaded {label} from {json_path}")
+        else:
+            logger.warning(f"{json_path} exists but has empty cookie_str")
+        return cookie
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"Failed to read {json_path}: {e}")
+        return ""
 
 
 def load_config() -> dict:
-    """Load configuration from shared cookie JSONs (preferred) or .env file."""
+    """Load configuration from shared cookie JSONs (no .env for cookies)."""
     load_dotenv()
 
     mids_str = os.getenv('BILI_MIDS', '')
@@ -246,7 +243,7 @@ def load_config() -> dict:
     if not weibo_cookie:
         logger.error(
             "Weibo cookie is not available.  "
-            "Set WEIBO_COOKIE in .env or ensure StreamMonitor/weibo_cookies.json exists."
+            "Ensure StreamMonitor/weibo_cookies.json exists with a valid cookie_str."
         )
         sys.exit(1)
 

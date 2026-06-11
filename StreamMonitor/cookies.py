@@ -31,7 +31,6 @@ import traceback
 from datetime import datetime
 from typing import Optional
 
-from dotenv import load_dotenv
 
 # ──────────────────────────────────────────────────────────────────────
 # Section A — Platform configuration
@@ -264,54 +263,9 @@ class _UnifiedCookieManager:
         self.set_health("degraded")
 
     # ── bootstrap from .env ─────────────────────────────────────────
-
-    @staticmethod
-    def bootstrap_from_env(platform: str) -> dict:
-        """Seed the JSON cookie file from ``.env`` on first run.
-
-        Safe to call on every startup — only writes if the file does not
-        already exist (data flows env → file, never file → env).
-        """
-        cfg = PLATFORM[platform]
-        file_path = _resolve_cookie_path(platform)
-        if os.path.exists(file_path):
-            return _UnifiedCookieManager(platform).load()
-
-        env_path = os.path.join(cfg["base_dir"], ".env")
-        if os.path.exists(env_path):
-            load_dotenv(env_path)
-
-        cookie_str = os.getenv(cfg["env_var"], "") or ""
-        if not cookie_str and cfg.get("env_var_fallback"):
-            cookie_str = os.getenv(cfg["env_var_fallback"], "") or ""
-
-        if not cookie_str:
-            print(
-                f"[{platform}] No {cfg['env_var']} in .env — "
-                f"cookie file will stay empty",
-                flush=True,
-            )
-            return _UnifiedCookieManager(platform).load()
-
-        data = dict(_DEFAULT_COOKIE_DATA[platform])
-        data.update(
-            {
-                "cookie_str": cookie_str,
-                "health": "ok",
-                "refresh_count": 0,
-            }
-        )
-        if platform == "douyin":
-            data["cookie_dict"] = parse_cookie_string(cookie_str)
-
-        mgr = _UnifiedCookieManager(platform)
-        mgr.save(data)
-        print(
-            f"[{platform}] Bootstrapped {cfg['cookie_file']} from .env "
-            f"({len(cookie_str)} chars)",
-            flush=True,
-        )
-        return data
+    # NOTE: Removed — cookies now live exclusively in JSON files.
+    #       bootstrap_from_env() was deleted; the refresher loop calls
+    #       the CookieManager directly instead.
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1170,9 +1124,6 @@ async def _refresher_loop(platform: str, interval: int | None = None):
         flush=True,
     )
 
-    # Bootstrap on first run
-    _UnifiedCookieManager.bootstrap_from_env(platform)
-
     # Run immediately so we don't wait N hours for initial data
     print(f"[{platform}] Running initial refresh...", flush=True)
     success, test_ok = await refresher.refresh()
@@ -1244,20 +1195,11 @@ class DouyinCookieManager(_CompatCookieManager):
     def get_auth_data(self) -> dict:
         return self._mgr.load()
 
-    @staticmethod
-    def bootstrap_from_env() -> dict:
-        return _UnifiedCookieManager.bootstrap_from_env("douyin")
-
-
 class WeiboCookieManager(_CompatCookieManager):
     """Backward-compat: ``weibo_cookie_manager.WeiboCookieManager``."""
 
     def __init__(self, cookies_file: str | None = None):
         super().__init__("weibo", cookies_file)
-
-    @staticmethod
-    def bootstrap_from_env() -> dict:
-        return _UnifiedCookieManager.bootstrap_from_env("weibo")
 
     @staticmethod
     def extract_xsrf(cookie_str: str) -> str:
@@ -1272,10 +1214,6 @@ class BilibiliCookieManager(_CompatCookieManager):
 
     def __init__(self, cookies_file: str | None = None):
         super().__init__("bilibili", cookies_file)
-
-    @staticmethod
-    def bootstrap_from_env() -> dict:
-        return _UnifiedCookieManager.bootstrap_from_env("bilibili")
 
     @staticmethod
     def extract_csrf(cookie_str: str) -> str:

@@ -1,19 +1,38 @@
+import json
 import os
-# from loguru import logger
-from dotenv import load_dotenv
+
+# Path to the shared cookie JSON (written by StreamMonitor cookie refresher)
+_STREAMMONITOR_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../StreamMonitor")
+)
+_COOKIE_JSON = os.path.join(_STREAMMONITOR_DIR, "cookies.json")
 
 dy_auth = None
 dy_live_auth = None
+
+
+def _read_douyin_cookie() -> str:
+    """Read douyin cookie from StreamMonitor/cookies.json."""
+    if not os.path.exists(_COOKIE_JSON):
+        print(f"[common_util] Cookie file not found: {_COOKIE_JSON}")
+        return ""
+    try:
+        with open(_COOKIE_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return (data or {}).get("cookie_str", "")
+    except Exception as e:
+        print(f"[common_util] Failed to read cookie JSON: {e}")
+        return ""
+
+
 def load_env():
     global dy_auth, dy_live_auth
-    load_dotenv()
-    cookies_dy = os.getenv('DY_COOKIES')
-    cookies_live = os.getenv('DY_LIVE_COOKIES')
+    cookie_str = _read_douyin_cookie()
     from builder.auth import DouyinAuth
     dy_auth = DouyinAuth()
-    dy_auth.perepare_auth(cookies_dy, "", "")
+    dy_auth.perepare_auth(cookie_str, "", "")
     dy_live_auth = DouyinAuth()
-    dy_live_auth.perepare_auth(cookies_live, "", "")
+    dy_live_auth.perepare_auth(cookie_str, "", "")
     return dy_auth
 
 def init():
