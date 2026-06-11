@@ -2399,7 +2399,7 @@ class DouyinLiveChecker:
                     )
                     # Mark cookie unhealthy for the refresher to see
                     try:
-                        from cookie_manager import CookieManager
+                        from cookies import CookieManager
                         CookieManager().mark_unhealthy()
                     except Exception:
                         pass
@@ -2987,7 +2987,7 @@ class StreamMonitor:
 
         # ── Douyin cookie ──────────────────────────────────────────
         try:
-            from cookie_manager import CookieManager
+            from cookies import CookieManager
             mgr = CookieManager()
             data = mgr.load()
             new_cookie = data.get('cookie_str', '')
@@ -3011,7 +3011,7 @@ class StreamMonitor:
 
         # ── Weibo cookie ───────────────────────────────────────────
         try:
-            from weibo_cookie_manager import WeiboCookieManager
+            from cookies import WeiboCookieManager
             wmgr = WeiboCookieManager()
             wdata = wmgr.load()
             new_weibo = wdata.get('cookie_str', '')
@@ -3790,7 +3790,7 @@ def main():
     # for the first _reload_cookies() call (5-min cooldown).
     if not args.dy_cookie:
         try:
-            from cookie_manager import CookieManager
+            from cookies import CookieManager
             _dy_data = CookieManager().load()
             _dy_json = _dy_data.get('cookie_str', '')
             if _dy_json:
@@ -3801,7 +3801,7 @@ def main():
 
     if not args.weibo_cookie:
         try:
-            from weibo_cookie_manager import WeiboCookieManager
+            from cookies import WeiboCookieManager
             _wb_data = WeiboCookieManager().load()
             _wb_json = _wb_data.get('cookie_str', '')
             if _wb_json:

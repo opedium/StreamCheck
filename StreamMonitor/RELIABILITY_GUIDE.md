@@ -166,7 +166,7 @@ df -h
 **手动强制刷新：**
 ```bash
 ssh root@167.99.73.192 'python3 -c "
-from cookie_manager import CookieManager
+from cookies import CookieManager
 mgr = CookieManager()
 data = mgr.load()
 print(\"Current health:\", data.get(\"health\"))
