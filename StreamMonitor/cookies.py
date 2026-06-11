@@ -438,24 +438,27 @@ class KeepaliveChecker:
             return False
 
     async def _check_weibo(self, cookie_str: str) -> bool:
-        """Check via the mobile API (bypasses desktop anti-bot)."""
+        """Check via weibo.com — alive if not redirected to passport."""
         import aiohttp
 
         try:
             headers = {
                 "User-Agent": self.cfg["user_agent"],
                 "Cookie": cookie_str,
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": "https://m.weibo.cn/",
             }
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    "https://m.weibo.cn/api/config",
+                    "https://weibo.com/",
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=self.KEEPALIVE_TIMEOUT),
+                    allow_redirects=True,
                 ) as resp:
-                    j = await resp.json()
-                    return j.get("data", {}).get("login") is True
+                    url = str(resp.url)
+                    return (
+                        "passport" not in url
+                        and "login" not in url
+                        and resp.status == 200
+                    )
         except Exception:
             return False
 
