@@ -838,7 +838,7 @@ class UnifiedCookieRefresher:
         return changed
 
     def _fmt_extra_cookies(self, cookie_str: str) -> str:
-        """Platform-specific extra cookie status (e.g. ttwid, odin_tt for douyin)."""
+        """Platform-specific extra cookie status."""
         if self.platform == "douyin":
             ttwid = extract_cookie_value(cookie_str, "ttwid")
             odin = extract_cookie_value(cookie_str, "odin_tt")
@@ -850,6 +850,18 @@ class UnifiedCookieRefresher:
                 parts.append("odin_tt ✅")
             if sessionid:
                 parts.append("sessionid ✅")
+            return "  ".join(parts)
+        if self.platform == "bilibili":
+            sess = extract_cookie_value(cookie_str, "SESSDATA")
+            bili_jct = extract_cookie_value(cookie_str, "bili_jct")
+            buvid3 = extract_cookie_value(cookie_str, "buvid3")
+            parts = []
+            if sess:
+                parts.append("SESSDATA ✅")
+            if bili_jct:
+                parts.append("bili_jct ✅")
+            if buvid3:
+                parts.append("buvid3 ✅")
             return "  ".join(parts)
         return ""
 
