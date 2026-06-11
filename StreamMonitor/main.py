@@ -2295,14 +2295,12 @@ class LiveStatsRecorder:
         The baseline for HTTP delta is http_follow_first (first precise API value)
         if available, which is immune to the ±500 万-rounding error.  Falls back
         to follower_before if no precise value has been captured yet.
-        WS delta uses follower_before as baseline (API is more reliable than
-        ws_follow_first which may drift).
         """
         baseline = self.http_follow_first if self.http_follow_first > 0 else self.follower_before
         http_delta = max(0, self.follower_count - baseline)
         ws_delta = 0
         if not self._ws_follow_stalled():
-            ws_delta = max(0, self.ws_follow_last - self.follower_before)
+            ws_delta = max(0, self.ws_follow_last - baseline)
         return max(http_delta, ws_delta)
 
     def _get_fan_club_joins(self) -> int:
@@ -3112,11 +3110,10 @@ class StreamMonitor:
             avg = ""
 
         # ── followers (关注涨幅度) ──
-        # Baseline: ws_follow_first (earliest SocialMessage.followCount),
-        # falling back to API follower_before.
-        # Derive fa = fb + delta so the displayed range is always consistent
-        # with the delta number (whether it came from HTTP or WS).
-        fb = r.ws_follow_first if r.ws_follow_first > 0 else r.follower_before
+        # Baseline: http_follow_first (first precise API value) if available,
+        # falling back to follower_before.  Must match _get_new_follows().
+        _baseline = r.http_follow_first if r.http_follow_first > 0 else r.follower_before
+        fb = _baseline if _baseline > 0 else r.ws_follow_first
         delta = r._get_new_follows()
         if fb > 0:
             followers_str = f"{fmt_wan(fb)} → {fmt_wan(fb + delta)}（+{fmt_wan(delta)}）"
