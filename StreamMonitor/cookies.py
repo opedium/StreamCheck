@@ -768,7 +768,12 @@ class UnifiedCookieRefresher:
 
     @staticmethod
     def _fmt_expiry(cookie_str: str) -> str:
-        """Parse ALF / session expiry from *cookie_str* for display."""
+        """Parse ALF / session expiry from *cookie_str* for display.
+
+        Only returns a value when ALF is in the future (positive days
+        remaining).  Weibo does not always update ALF on every page
+        visit, so a stale / past ALF is silently ignored.
+        """
         for part in cookie_str.split(";"):
             part = part.strip()
             if part.startswith("ALF="):
@@ -778,6 +783,8 @@ class UnifiedCookieRefresher:
                     dt = datetime.fromtimestamp(ts)
                     remaining = dt - datetime.now()
                     days = remaining.days
+                    if days < 0:
+                        return ""  # stale ALF, ignore
                     label = f"{dt.strftime('%Y-%m-%d')} ({days}d)"
                     if days < 7:
                         label += " ⚠️"
