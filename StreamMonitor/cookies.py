@@ -508,6 +508,7 @@ class UnifiedCookieRefresher:
         self.pool = CookiePool(platform, self.manager)
         self.keepalive = KeepaliveChecker(platform)
         self.notifier = notifier
+        self._refresh_info: dict = {}  # populated by _browser_refresh
 
     # ── public entry point ──────────────────────────────────────────
 
@@ -553,16 +554,13 @@ class UnifiedCookieRefresher:
 
         # Layer 5 — alert (Layer 4 = CookiePool, transparent here)
         if not success and self.notifier:
-            msg = (
-                f"{self.platform} cookie refresh FAILED — "
-                f"session may be dead, check logs"
-            )
-            self.notifier.send(msg, state="dead")
-        elif success and self.notifier:
-            tag = "testing passed" if test_ok else "testing failed"
             self.notifier.send(
-                f"{self.platform} cookie refreshed ({tag}) "
-                f"[{datetime.now().strftime('%H:%M')}]",
+                self._format_refresh_msg(success, test_ok, method="browser"),
+                state="dead",
+            )
+        elif success and self.notifier:
+            self.notifier.send(
+                self._format_refresh_msg(success, test_ok, method="browser"),
                 state=None,
             )
 
@@ -681,6 +679,16 @@ class UnifiedCookieRefresher:
                         flush=True,
                     )
 
+                # Stash info for Telegram notification
+                self._refresh_info = {
+                    "cookie_count": len(new_cookies),
+                    "missing": missing,
+                    "new_cookie_str": new_cookie_str,
+                    "sub_renewed": self._detect_sub_renewal(
+                        new_cookie_str, prev_data.get("cookie_str", "")
+                    ),
+                }
+
                 # Platform-specific post-processing
                 if self.platform == "douyin":
                     return await self._finalise_douyin(
@@ -755,6 +763,83 @@ class UnifiedCookieRefresher:
     async def _test_cookie(self, cookie_str: str) -> bool:
         """Validate the cookie against the platform API."""
         return await self.keepalive.check(cookie_str)
+
+    # ── Telegram message formatting ────────────────────────────────────
+
+    @staticmethod
+    def _fmt_expiry(cookie_str: str) -> str:
+        """Parse ALF / session expiry from *cookie_str* for display."""
+        for part in cookie_str.split(";"):
+            part = part.strip()
+            if part.startswith("ALF="):
+                try:
+                    val = part.split("=", 1)[1]
+                    ts = int(val.split("_")[-1])
+                    dt = datetime.fromtimestamp(ts)
+                    remaining = dt - datetime.now()
+                    days = remaining.days
+                    label = f"{dt.strftime('%Y-%m-%d')} ({days}d)"
+                    if days < 7:
+                        label += " ⚠️"
+                    return label
+                except Exception:
+                    pass
+        return ""
+
+    @staticmethod
+    def _fmt_cookies_list(cookie_str: str, critical_keys: list[str]) -> str:
+        """Build a compact status string like ``SUB ✅ SCF ✅ XSRF ✅``."""
+        parsed = parse_cookie_string(cookie_str)
+        parts = []
+        for k in critical_keys:
+            if k in parsed and parsed[k]:
+                parts.append(f"{k} ✅")
+            else:
+                parts.append(f"{k} ❌")
+        return "  ".join(parts)
+
+    @staticmethod
+    def _detect_sub_renewal(new_cookie_str: str, old_cookie_str: str) -> bool:
+        """Return ``True`` if the SUB cookie value changed (session renewed)."""
+        old_sub = extract_cookie_value(old_cookie_str, "SUB")
+        new_sub = extract_cookie_value(new_cookie_str, "SUB")
+        return bool(new_sub and new_sub != old_sub)
+
+    def _format_refresh_msg(
+        self,
+        success: bool,
+        test_ok: bool,
+        method: str = "keepalive",
+    ) -> str:
+        """Build a detailed Telegram message for the refresh result."""
+        ri = self._refresh_info
+        ts = datetime.now().strftime("%H:%M")
+
+        if method == "keepalive":
+            return f"🟢 {self.platform} cookie still valid [{ts}]"
+
+        if not success:
+            return (
+                f"🔴 {self.platform} cookie refresh FAILED [{ts}]\n"
+                f"Session dead — check logs"
+            )
+
+        # Success with browser refresh
+        expiry = self._fmt_expiry(ri.get("new_cookie_str", ""))
+        ck = self._fmt_cookies_list(
+            ri.get("new_cookie_str", ""), self.cfg["critical_cookies"]
+        )
+        count = ri.get("cookie_count", 0)
+        renewed = ri.get("sub_renewed", False)
+
+        icon = "🟢" if test_ok else "🟡"
+        renewed_tag = " SUB renewed" if renewed else ""
+        expiry_line = f"\n  Expires: {expiry}" if expiry else ""
+
+        return (
+            f"{icon} {self.platform} refreshed{renewed_tag} [{ts}]\n"
+            f"  Cookies: {count} ({ck}){expiry_line}"
+        )
 
     def _clean_profile(self):
         """Layer 3 — delete the browser profile and recreate.
