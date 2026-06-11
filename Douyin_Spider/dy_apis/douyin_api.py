@@ -763,9 +763,12 @@ class DouyinAPI:
                 'browser_online': 'true', 'tz_name': 'Asia/Shanghai',
                 'web_rid': live_id,
             }
+            # Strip s_v_web_id — Douyin returns empty responses when this
+            # device-fingerprint cookie is sent on non-browser HTTP clients.
+            _api_cookies = {k: v for k, v in auth_.cookie.items() if k != "s_v_web_id"}
             resp = requests.get(
                 'https://live.douyin.com/webcast/room/web/enter/',
-                params=params, cookies=auth_.cookie,
+                params=params, cookies=_api_cookies,
                 headers={
                     'Accept': 'application/json',
                     'Referer': f'https://live.douyin.com/{live_id}',
@@ -808,8 +811,9 @@ class DouyinAPI:
                 "accept": "text/html,*/*",
                 "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             }
+            _page_cookies = {k: v for k, v in auth_.cookie.items() if k != "s_v_web_id"}
             res = requests.get(f"https://live.douyin.com/{live_id}",
-                               headers=headers, cookies=auth_.cookie, verify=False, timeout=10)
+                               headers=headers, cookies=_page_cookies, verify=False, timeout=10)
             ttwid = res.cookies.get_dict().get('ttwid', '')
             return {
                 "room_id": "", "user_id": "", "user_unique_id": "",
