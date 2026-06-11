@@ -3293,6 +3293,23 @@ class StreamMonitor:
             logger.error(f"Error writing notification CSV: {e}")
 
     def handle_live(self, room_info: dict):
+        # ── New stream: clean old data from previous stream ──────────
+        # Clear live_stats.json so the dashboard doesn't show stale data
+        # from a previous stream while this one is starting up.
+        try:
+            _clean = {"live": False, "cleaned_at": datetime.now().isoformat()}
+            with open(STATS_FILE + '.tmp', 'w', encoding='utf-8') as _cf:
+                json.dump(_clean, _cf, ensure_ascii=False)
+            os.replace(STATS_FILE + '.tmp', STATS_FILE)
+        except Exception:
+            pass
+        # Clear notification_log.csv — old notifications are from a previous stream.
+        try:
+            if os.path.exists(_NOTIF_CSV_FILE):
+                os.remove(_NOTIF_CSV_FILE)
+        except Exception:
+            pass
+
         title = room_info.get('room_title', self.live_title or '')
 
         # FIX: Store anchor nickname from HTTP page data as fallback for handle_offline
