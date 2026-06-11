@@ -438,29 +438,18 @@ class KeepaliveChecker:
             return False
 
     async def _check_weibo(self, cookie_str: str) -> bool:
-        """Check via weibo.com — alive if not redirected to passport."""
-        import aiohttp
+        """HTTP keepalive is NOT possible for weibo.com.
 
-        try:
-            headers = {
-                "User-Agent": self.cfg["user_agent"],
-                "Cookie": cookie_str,
-            }
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://weibo.com/",
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=self.KEEPALIVE_TIMEOUT),
-                    allow_redirects=True,
-                ) as resp:
-                    url = str(resp.url)
-                    return (
-                        "passport" not in url
-                        and "login" not in url
-                        and resp.status == 200
-                    )
-        except Exception:
-            return False
+        Weibo actively blocks ALL non-browser HTTP requests — every endpoint
+        (``/``, ``/login``, ``/ajax/profile/info``) redirects to
+        ``login.sina.com.cn`` regardless of cookie validity.  The mobile
+        API at ``m.weibo.cn`` uses a separate auth system and refuses
+        desktop ``.weibo.com`` cookies.
+
+        The only reliable check is via Playwright (Layer 2), so this method
+        always returns ``False`` to fall through to the browser refresh.
+        """
+        return False
 
     async def _check_bilibili(self, cookie_str: str) -> bool:
         """Check via the nav API — ``code == 0`` means authenticated."""
@@ -954,8 +943,18 @@ class UnifiedCookieRefresher:
         **FIX:** The old Bilibili refresher called ``save()`` *before*
         ``_test_cookie()`` — if the test failed, the good cookie was
         already overwritten.  We now test first and only save on PASS.
+
+        For **Weibo**, HTTP keepalive is impossible (all endpoints redirect
+        to login for non-browser requests), so ``_test_cookie()`` is
+        skipped.  Browser-level checks (no passport redirect + SUB present)
+        are sufficient validation — ``_is_dead_url`` and
+        ``_missing_critical`` already handle this upstream.
         """
-        test_ok = await self._test_cookie(new_cookie_str)
+        # Weibo: trust browser extraction — HTTP test is impossible
+        if self.platform == "weibo":
+            test_ok = True
+        else:
+            test_ok = await self._test_cookie(new_cookie_str)
 
         if test_ok:
             health = self._determine_health(new_cookies, missing)
