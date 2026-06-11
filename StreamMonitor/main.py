@@ -918,9 +918,45 @@ class LiveStatsRecorder:
             # Instead just log that we have room_id for reference.
             logger.info(f"[HTTP Recovery] Room confirmed: room_id={room_id}, user_id={user_id}")
             
-            # Get follower count from user info
+            # ── Follower count: HTML page data first (0-API-call path) ──
+            # check_status() already extracts followerCount from the live
+            # page's RENDER_DATA/__INITIAL_STATE__ and stores it in
+            # _http_room_info['follower_count'].  Use this as the primary
+            # source — it costs 0 API calls and survives API outages.
+            # Fall back to get_user_info() API only when HTML data is absent.
+            _html_fc = room_info.get('follower_count', 0)
+            if isinstance(_html_fc, str):
+                _html_fc = 0
+            _html_fc = int(_html_fc) if _html_fc else 0
+
             sec_uid = room_info.get('sec_uid', '')
-            if sec_uid:
+            if _html_fc > 0 and sec_uid:
+                # HTML page data is available — skip the API call entirely.
+                logger.info(f"[HTTP Follow] Using HTML page follower_count={_html_fc:,} (0 API calls)")
+                fc_int = _html_fc
+                _fc_precision_loss = False
+                # Apply baseline and smoothing (same logic as API path below)
+                if not getattr(self, '_http_first_seen', False):
+                    self._http_first_seen = True
+                    self.http_follow_first = fc_int
+                    if fc_int > self.http_follow_last:
+                        self.http_follow_last = fc_int
+                    if self.verbose:
+                        logger.info(f"[HTTP Follow] http_follow_first={fc_int:,} (from HTML page)")
+                if fc_int > 0:
+                    _min_acceptable = int(self.follower_count * 0.99)
+                    if fc_int >= _min_acceptable or fc_int > self.follower_count:
+                        self.follower_count = fc_int
+                if fc_int > self.http_follow_last:
+                    self.http_follow_last = fc_int
+                    if self.verbose:
+                        logger.info(f"[HTTP Follow] http_follow_last={fc_int:,}")
+                self.follower_after = self.follower_count
+                logger.info(f"[HTTP Refresh] WS follower={self.ws_follow_last:,}, "
+                            f"HTML={fc_int:,}, follower_after={self.follower_after:,}, "
+                            f"http_delta={max(0, self.http_follow_last - self.http_follow_first):,}")
+            elif sec_uid:
+                # No HTML data — fall back to get_user_info API call
                 user_url = f"https://www.douyin.com/user/{sec_uid}"
                 with _suppress_stdout():
                     user_info = DouyinAPI.get_user_info(auth, user_url)
@@ -2259,12 +2295,14 @@ class LiveStatsRecorder:
         The baseline for HTTP delta is http_follow_first (first precise API value)
         if available, which is immune to the ±500 万-rounding error.  Falls back
         to follower_before if no precise value has been captured yet.
+        WS delta uses follower_before as baseline (API is more reliable than
+        ws_follow_first which may drift).
         """
         baseline = self.http_follow_first if self.http_follow_first > 0 else self.follower_before
         http_delta = max(0, self.follower_count - baseline)
         ws_delta = 0
         if not self._ws_follow_stalled():
-            ws_delta = max(0, self.ws_follow_last - self.ws_follow_first)
+            ws_delta = max(0, self.ws_follow_last - self.follower_before)
         return max(http_delta, ws_delta)
 
     def _get_fan_club_joins(self) -> int:
@@ -2448,11 +2486,85 @@ class DouyinLiveChecker:
             return int(fc)
         return 0
 
+    def _check_status_via_api(self) -> dict | None:
+        """Check live status via the official /webcast/room/web/enter/ API.
+
+        This is the same endpoint the Douyin SPA itself uses — far more
+        reliable than HTML regex parsing.  Returns the same dict shape as
+        check_status(), or None on failure.
+
+        Response fields:
+          data.data[0].status      2=LIVE  4=OFFLINE
+          data.data[0].id_str      room_id
+          data.data[0].title       stream title
+          data.data[0].user_count_str  viewer count (may contain "万")
+          data.data[0].like_count  total likes
+          data.user.id_str         anchor user_id
+          data.user.sec_uid        anchor sec_uid
+          data.user.nickname       anchor nickname
+        """
+        try:
+            params = {
+                'aid': '6383', 'app_name': 'douyin_web', 'live_id': '1',
+                'device_platform': 'web', 'language': 'zh-CN',
+                'enter_from': 'link_share', 'cookie_enabled': 'true',
+                'screen_width': '1280', 'screen_height': '720',
+                'browser_language': 'zh-CN', 'browser_platform': 'Win32',
+                'browser_name': 'Chrome', 'browser_version': '143.0.0.0',
+                'browser_online': 'true', 'tz_name': 'Asia/Shanghai',
+                'web_rid': self.live_id,
+            }
+            # Strip s_v_web_id from cookies for the same reason as
+            # check_status() — it causes empty responses on non-browser clients.
+            page_cookies = {
+                k: v for k, v in self.cookie.items()
+                if k != "s_v_web_id"
+            }
+            api_url = 'https://live.douyin.com/webcast/room/web/enter/'
+            resp = requests.get(api_url, params=params, cookies=page_cookies,
+                                headers=self.HEADERS, verify=False, timeout=15)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            room = (data or {}).get('data', {}).get('data', [None])[0]
+            if room is None:
+                return None
+            user = (data or {}).get('data', {}).get('user', {})
+            room_status = str(room.get('status', self.STATUS_OFFLINE))
+            self._last_status = room_status
+            return {
+                "room_id": str(room.get('id_str', '')),
+                "user_id": str(user.get('id_str', '')),
+                "user_unique_id": str(user.get('id_str', '')),
+                "anchor_id": str(user.get('id_str', '')),
+                "sec_uid": user.get('sec_uid', ''),
+                "ttwid": '',
+                "room_status": room_status,
+                "room_title": room.get('title', ''),
+                "anchor_nickname": user.get('nickname', ''),
+                "follower_count": 0,  # not in this endpoint
+            }
+        except Exception as e:
+            logger.debug(f"[CheckStatus] API check failed: {e}")
+            return None
+
     def check_status(self) -> dict:
-        """Check Douyin stream status with retry logic for timeouts."""
+        """Check Douyin stream status.
+
+        Strategy 1: Call the official /webcast/room/web/enter/ API
+        (reliable, same endpoint the SPA uses).
+        Strategy 2: Fall back to HTML page parsing (legacy, may fail on
+        modern SPA pages that load data asynchronously).
+        """
+        # Strategy 1: API-based check (primary)
+        api_result = self._check_status_via_api()
+        if api_result is not None:
+            return api_result
+
+        # Strategy 2: HTML page parsing (legacy fallback)
         max_retries = 3
         retry_delay = 2
-        
+
         for attempt in range(max_retries):
             url = f"https://live.douyin.com/{self.live_id}"
             try:
