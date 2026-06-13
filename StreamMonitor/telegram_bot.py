@@ -88,19 +88,8 @@ class TelegramBot:
                                 "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
                     args=["--disable-blink-features=AutomationControlled"],
                 )
-                if old:
-                    seeds = []
-                    for part in old.split(";"):
-                        part = part.strip()
-                        if "=" in part:
-                            k, v = part.split("=", 1)
-                            seeds.append({"name": k.strip(), "value": v.strip(),
-                                          "domain": ".douyin.com", "path": "/"})
-                    if seeds:
-                        try:
-                            await ctx.add_cookies(seeds)
-                        except Exception:
-                            pass
+                # Don't seed old cookies — we want the QR login page to appear
+                # so the user can scan and get fresh cookies.
                 page = await ctx.new_page()
 
                 # Visit user/self — shows QR if logged out, profile if logged in
