@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # coding=utf-8
 """
-Telegram bot — receive commands, send QR codes, save cookies.
-
-Listens for:
-  /refresh_douyin  — request a Douyin QR code, send to Telegram, poll for scan
+Telegram bot — /refresh_douyin: QR login via Playwright end-to-end.
 """
 
 import asyncio
@@ -23,7 +20,6 @@ _dy_path = os.path.abspath(_dy_path)
 if _dy_path not in sys.path:
     sys.path.insert(0, _dy_path)
 
-from builder.auth import DouyinAuth
 from builder.params import Params
 from utils.dy_util import generate_msToken
 from telegram_notifier import TelegramNotifier
@@ -36,8 +32,8 @@ def _cookie_dict_to_str(cd: dict) -> str:
     return "; ".join(f"{k}={v}" for k, v in cd.items())
 
 
-def _sso_params() -> dict:
-    """Build SSO query params for the QR endpoint (same as login_api.py)."""
+def _sso_query() -> dict:
+    """Build SSO query params (same as login_api.py)."""
     msToken = generate_msToken()
     params = Params()
     params.add_param("service", "https://www.douyin.com")
@@ -57,39 +53,14 @@ def _sso_params() -> dict:
     params.add_param("device_platform", "web_app")
     params.add_param("msToken", msToken)
     params.with_a_bogus()
-    return params.get(), msToken
+    return params.get()
 
 
-def _check_qr(auth: DouyinAuth, token: str) -> dict:
-    """Poll QR scan status."""
-    params = Params()
-    params.add_param("token", token)
-    params.add_param("service", "https://www.douyin.com")
-    params.add_param("need_logo", "false")
-    params.add_param("need_short_url", "false")
-    params.add_param("passport_jssdk_version", "1.0.26")
-    params.add_param("passport_jssdk_type", "pro")
-    params.add_param("aid", "6383")
-    params.add_param("language", "zh")
-    params.add_param("account_sdk_source", "sso")
-    params.add_param("device_platform", "web_app")
-    _msToken = auth.cookie.get("msToken", "") or generate_msToken()
-    auth.cookie["msToken"] = _msToken
-    params.add_param("msToken", _msToken)
-    params.with_a_bogus()
-
-    resp = requests.get(
-        _SSO_BASE + "check_qrconnect/",
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.douyin.com/",
-        },
-        cookies=auth.cookie,
-        params=params.get(),
-        verify=False,
-        timeout=15,
-    )
-    return resp.json()
+def _build_url(base: str, query: dict, extra: dict = None) -> str:
+    q = dict(query)
+    if extra:
+        q.update(extra)
+    return base + "?" + "&".join(f"{k}={v}" for k, v in q.items())
 
 
 class TelegramBot:
@@ -136,8 +107,6 @@ class TelegramBot:
         self._api("sendPhoto", files={"photo": ("qr.png", data, "image/png")},
                   data={"chat_id": cid, "caption": caption})
 
-    # ── /refresh_douyin ──────────────────────────────────────────────
-
     def _handle_refresh_douyin(self, cid: int | str):
         self.send_message(cid, "🔄 Launching browser...")
 
@@ -172,10 +141,8 @@ class TelegramBot:
                         part = part.strip()
                         if "=" in part:
                             k, v = part.split("=", 1)
-                            seeds.append({
-                                "name": k.strip(), "value": v.strip(),
-                                "domain": ".douyin.com", "path": "/",
-                            })
+                            seeds.append({"name": k.strip(), "value": v.strip(),
+                                          "domain": ".douyin.com", "path": "/"})
                     if seeds:
                         try:
                             await ctx.add_cookies(seeds)
@@ -184,12 +151,12 @@ class TelegramBot:
 
                 page = await ctx.new_page()
 
-                # Visit douyin.com to establish base cookies
+                # Establish session on douyin.com
                 await page.goto("https://www.douyin.com/",
                                 wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(3000)
 
-                # Intercept SSO response
+                # Intercept SSO QR response
                 qr_data = {}
 
                 async def _on_response(resp):
@@ -198,123 +165,105 @@ class TelegramBot:
                             data = await resp.json()
                             if data.get("data", {}).get("qrcode_index_url"):
                                 qr_data.update(data)
-                                print("[TGBot] QR data intercepted", flush=True)
                         except Exception:
                             pass
 
                 page.on("response", _on_response)
 
-                # Navigate to SSO URL — browser handles anti-bot natively
-                query, msToken = _sso_params()
-                sso_url = _SSO_BASE + "get_qrcode/?" + "&".join(
-                    f"{k}={v}" for k, v in query.items()
-                )
+                # Request QR code via SSO
+                sso_url = _build_url(_SSO_BASE + "get_qrcode/", _sso_query())
                 await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(5000)
 
                 if not qr_data:
-                    print("[TGBot] No QR data intercepted", flush=True)
+                    await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(5000)
+
+                if not qr_data:
+                    self.send_message(cid, "❌ No QR data from SSO")
                     await ctx.close()
-                    return None, None, None
+                    return
 
                 token = qr_data["data"]["token"]
                 qr_url = qr_data["data"]["qrcode_index_url"]
+                print(f"[TGBot] QR OK token={token[:20]}...", flush=True)
 
-                # Extract cookies from browser after anti-bot
+                # Send QR to Telegram immediately
+                img = qrcode.make(qr_url)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                buf.seek(0)
+                self.send_photo(cid, buf.getvalue(),
+                                caption="📱 **Douyin QR Login**\nScan with the Douyin app.\n⏳ Polling for 5 minutes…")
+
+                # Poll for scan inside the browser (keeps SSO cookies alive)
+                print("[TGBot] Polling...", flush=True)
+                check_query = _sso_query()
+                for i in range(60):
+                    await asyncio.sleep(5)
+                    try:
+                        url = _build_url(_SSO_BASE + "check_qrconnect/",
+                                         check_query, {"token": token})
+                        resp = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                        await page.wait_for_timeout(1000)
+                        body = await page.evaluate("document.body.innerText")
+                        check = _json.loads(body.strip())
+                        err = check.get("error_code", -1)
+                        print(f"[TGBot] Poll {i*5}s: err={err}", flush=True)
+
+                        if err == 0:
+                            redirect_url = check.get("data", {}).get("redirect_url", "")
+                            if redirect_url:
+                                await page.goto(redirect_url, wait_until="domcontentloaded", timeout=15000)
+                                await page.wait_for_timeout(3000)
+                            break
+                        elif err == 10001:
+                            self.send_message(cid, "⏰ QR expired")
+                            await ctx.close()
+                            return
+                    except Exception as e:
+                        print(f"[TGBot] Poll err ({i*5}s): {e}", flush=True)
+                        continue
+                else:
+                    self.send_message(cid, "⏰ Timed out (5 min)")
+                    await ctx.close()
+                    return
+
+                # Extract fresh cookies after login
                 raw = await ctx.cookies()
                 cookies = {c["name"]: c["value"] for c in raw}
                 if "msToken" not in cookies:
-                    cookies["msToken"] = msToken
-
+                    cookies["msToken"] = generate_msToken()
                 await ctx.close()
-                return cookies, token, qr_url
 
-        try:
-            cookies, token, qr_url = asyncio.run(_run())
-        except Exception as e:
-            self.send_message(cid, f"❌ Browser error: {e}")
-            return
-
-        if not qr_url:
-            self.send_message(cid, "❌ Failed to get QR code")
-            return
-
-        auth = DouyinAuth()
-        auth.cookie = cookies
-        auth.cookie_str = _cookie_dict_to_str(cookies)
-        print(f"[TGBot] QR OK — token={token[:20]}... {len(cookies)} cookies", flush=True)
-
-        # Send QR to Telegram
-        img = qrcode.make(qr_url)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        self.send_photo(
-            cid, buf.getvalue(),
-            caption="📱 **Douyin QR Login**\nScan with the Douyin app.\n⏳ Polling for 5 minutes…",
-        )
-
-        # Poll for scan
-        poll_sec = 0
-        while poll_sec < 300:
-            time.sleep(5)
-            poll_sec += 5
-            try:
-                check = _check_qr(auth, token)
-            except Exception as e:
-                print(f"[TGBot] Poll error ({poll_sec}s): {e}", flush=True)
-                continue
-
-            err = check.get("error_code", -1)
-            print(f"[TGBot] Poll {poll_sec}s: err={err}", flush=True)
-
-            if err == 0:
-                redirect_url = check.get("data", {}).get("redirect_url", "")
-                if not redirect_url:
-                    self.send_message(cid, "❌ No redirect after scan")
-                    return
-
-                session = requests.Session()
-                session.cookies.update(auth.cookie)
-                hdrs = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                }
-                resp = session.get(redirect_url, headers=hdrs, allow_redirects=True, timeout=15)
-                merged = dict(session.cookies)
-                for c in resp.cookies:
-                    merged[c.name] = c.value
-
-                new_str = _cookie_dict_to_str(merged)
-                print(f"[TGBot] Login OK — {len(merged)} cookies", flush=True)
+                new_str = _cookie_dict_to_str(cookies)
+                print(f"[TGBot] Login OK — {len(cookies)} cookies", flush=True)
 
                 try:
                     from cookies import DouyinCookieManager
                     d = DouyinCookieManager().load()
                     d["cookie_str"] = new_str
-                    d["cookie_dict"] = merged
+                    d["cookie_dict"] = cookies
                     d["health"] = "ok"
                     d["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                     d["refresh_count"] = d.get("refresh_count", 0) + 1
                     DouyinCookieManager().save(d)
                 except Exception as e:
-                    self.send_message(cid, f"❌ Save failed: {e}")
+                    self.send_message(cid, f"❌ Save: {e}")
                     return
 
-                self.send_message(
-                    cid,
-                    f"✅ **Douyin QR login OK**\n{len(merged)} cookies saved, health=ok",
-                )
-                return
+                self.send_message(cid,
+                    f"✅ **Douyin QR login OK**\n{len(cookies)} cookies saved, health=ok")
 
-            elif err == 10001:
-                self.send_message(cid, "⏰ QR expired — send /refresh_douyin again")
-                return
-
-        self.send_message(cid, "⏰ Timed out (5 min) — send /refresh_douyin again")
+        try:
+            asyncio.run(_run())
+        except Exception as e:
+            self.send_message(cid, f"❌ Error: {e}")
 
     def run(self):
         print("[TGBot] Starting...", flush=True)
-        self.send_message(self.chat_id, "🟢 **Cookie bot online**\nCommands:\n  `/refresh_douyin`")
+        self.send_message(self.chat_id,
+            "🟢 **Cookie bot online**\nCommands:\n  `/refresh_douyin`")
         while True:
             try:
                 for update in self.get_updates():
@@ -326,7 +275,7 @@ class TelegramBot:
                     if text == "/refresh_douyin":
                         self._handle_refresh_douyin(cid)
                     else:
-                        self.send_message(cid, f"Unknown: `{text}`\nAvailable: `/refresh_douyin`")
+                        self.send_message(cid, f"Unknown: `{text}`")
             except Exception as e:
                 print(f"[TGBot] Loop: {e}", flush=True)
                 traceback.print_exc()
