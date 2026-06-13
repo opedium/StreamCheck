@@ -85,5 +85,18 @@ module.exports = {
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       autorestart: true,
     },
+    {
+      name: 'telegram-bot',
+      script: '/root/StreamCheck/StreamMonitor/telegram_bot.py',
+      interpreter: '/root/StreamCheck/venv/bin/python3',
+      cwd: '/root/StreamCheck/StreamMonitor',
+      restart_delay: 10000,
+      max_restarts: 10,
+      error_file: '/root/StreamCheck/logs/telegram-bot-err.log',
+      out_file: '/root/StreamCheck/logs/telegram-bot-out.log',
+      merge_logs: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      autorestart: true,
+    },
   ]
 };
