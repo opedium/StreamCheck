@@ -96,11 +96,11 @@ class TelegramBot:
                   data={"chat_id": cid, "caption": caption})
 
     def _handle_refresh_douyin(self, cid):
-        self.send_message(cid, "🔄 Launching browser...")
+        self.send_message(cid, "Launching browser...")
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            self.send_message(cid, "❌ Playwright not installed")
+            self.send_message(cid, "Playwright not installed")
             return
 
         old = ""
@@ -156,7 +156,7 @@ class TelegramBot:
                     await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
                     await page.wait_for_timeout(5000)
                 if not qr_data:
-                    self.send_message(cid, "❌ No QR data")
+                    self.send_message(cid, "No QR data")
                     await ctx.close()
                     return
 
@@ -169,21 +169,24 @@ class TelegramBot:
                 img.save(buf, format="PNG")
                 buf.seek(0)
                 self.send_photo(cid, buf.getvalue(),
-                    caption="📱 Douyin QR Login\nScan with Douyin app.\nPolling 5 min...")
+                    caption="Douyin QR Login\nScan with Douyin app.\nPolling 5 min...")
 
-                # Poll via page.evaluate with fetch() — avoids anti-bot nav block
+                # Poll via Playwright's page.request — bypasses JS monkey-patching
+                # of window.fetch by Douyin's security SDK (sdk-glue.js).
                 print("[TGBot] Polling...", flush=True)
                 cq = _sso_query()
                 for i in range(60):
                     await asyncio.sleep(5)
                     try:
                         url = _build_url(_SSO_BASE + "check_qrconnect/", cq, {"token": token})
-                        js = """(u) => fetch(u, {credentials: "include"}).then(r => r.text())"""
-                        body = await page.evaluate(js, url)
+                        resp = await page.request.fetch(url)
+                        body = await resp.text()
                         check = _json.loads(body.strip())
                         err = check.get("error_code", -1)
                         print(f"[TGBot] Poll {i*5}s err={err}", flush=True)
+
                         if err == 0:
+                            self.send_message(cid, "QR scanned! Following redirect...")
                             ru = check.get("data", {}).get("redirect_url", "")
                             if ru:
                                 await page.goto(ru, wait_until="domcontentloaded", timeout=15000)
