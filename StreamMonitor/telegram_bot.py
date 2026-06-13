@@ -97,10 +97,9 @@ class TelegramBot:
                                 wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(5000)
 
-                # Check if already logged in (no QR shown)
-                current_url = page.url
-                if "login_page" not in current_url and "user/self" in current_url:
-                    # Already logged in — cookies are still valid
+                # Check if already logged in — sessionid cookie means valid session
+                raw_cookies = {c["name"]: c["value"] for c in await ctx.cookies()}
+                if "sessionid" in raw_cookies:
                     self.send_message(cid, "Already logged in — cookies still valid")
                     await ctx.close()
                     return
