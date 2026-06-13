@@ -1161,7 +1161,7 @@ async def _refresher_loop(platform: str, interval: int | None = None):
     print(f"[{platform}] Running initial refresh...", flush=True)
     await refresher.refresh()
 
-    POLL = 60  # wake every 60s to check for emergency triggers
+    POLL = 60  # wake every 60s to check health + keepalive
 
     while True:
         # Sleep in short increments so we can detect health=expired
@@ -1169,7 +1169,27 @@ async def _refresher_loop(platform: str, interval: int | None = None):
         for _ in range(interval // POLL):
             await asyncio.sleep(POLL)
             data = refresher.pool.get_active()
-            if data.get("health") == "expired":
+            cookie_str = data.get("cookie_str", "")
+            health = data.get("health", "")
+
+            # Active keepalive check — test the cookie against the
+            # platform's API.  This catches silent expiry faster than
+            # waiting for streammonitor or a posting failure.
+            if cookie_str:
+                alive = await refresher.keepalive.check(cookie_str)
+                if not alive:
+                    print(
+                        f"[{platform}] Keepalive FAILED — "
+                        f"marking unhealthy and refreshing",
+                        flush=True,
+                    )
+                    refresher.manager.mark_unhealthy()
+                    await refresher.refresh()
+                    break  # restart the interval timer
+
+            # Passive check — streammonitor or another process marked
+            # the cookie expired via mark_unhealthy().
+            if health == "expired":
                 print(
                     f"[{platform}] Health=expired detected — "
                     f"forcing immediate refresh",

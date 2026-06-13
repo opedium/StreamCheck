@@ -2833,6 +2833,11 @@ class WeiboPoster:
                 f"Weibo post FAILED after {max_retries} retries — "
                 f"auth error code={last_error_code}"
             )
+            try:
+                from cookies import WeiboCookieManager
+                WeiboCookieManager().mark_unhealthy()
+            except Exception:
+                pass
         return False
 
     @staticmethod
@@ -3259,6 +3264,11 @@ class StreamMonitor:
                     f"live notification skipped",
                     state="weibo_cookie_invalid_live",
                 )
+                try:
+                    from cookies import WeiboCookieManager
+                    WeiboCookieManager().mark_unhealthy()
+                except Exception:
+                    pass
                 success = False
             else:
                 success = self.poster.post_tweet(content)
@@ -3541,6 +3551,11 @@ class StreamMonitor:
                     f"offline summary skipped",
                     state="weibo_cookie_invalid_offline",
                 )
+                try:
+                    from cookies import WeiboCookieManager
+                    WeiboCookieManager().mark_unhealthy()
+                except Exception:
+                    pass
                 success = False
             else:
                 success = self.poster.post_tweet(content)
