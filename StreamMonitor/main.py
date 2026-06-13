@@ -918,100 +918,16 @@ class LiveStatsRecorder:
             # Instead just log that we have room_id for reference.
             logger.info(f"[HTTP Recovery] Room confirmed: room_id={room_id}, user_id={user_id}")
             
-            # ── Follower count: HTML page data first (0-API-call path) ──
-            # check_status() already extracts followerCount from the live
-            # page's RENDER_DATA/__INITIAL_STATE__ and stores it in
-            # _http_room_info['follower_count'].  Use this as the primary
-            # source — it costs 0 API calls and survives API outages.
-            # Fall back to get_user_info() API only when HTML data is absent.
-            _html_fc = room_info.get('follower_count', 0)
-            if isinstance(_html_fc, str):
-                _html_fc = 0
-            _html_fc = int(_html_fc) if _html_fc else 0
-
-            sec_uid = room_info.get('sec_uid', '')
-            if _html_fc > 0 and sec_uid:
-                # HTML page data is available — skip the API call entirely.
-                logger.info(f"[HTTP Follow] Using HTML page follower_count={_html_fc:,} (0 API calls)")
-                fc_int = _html_fc
-                _fc_precision_loss = False
-                # Apply baseline and smoothing (same logic as API path below)
-                if not getattr(self, '_http_first_seen', False):
-                    self._http_first_seen = True
-                    self.http_follow_first = fc_int
-                    if fc_int > self.http_follow_last:
-                        self.http_follow_last = fc_int
-                    if self.verbose:
-                        logger.info(f"[HTTP Follow] http_follow_first={fc_int:,} (from HTML page)")
-                if fc_int > 0:
-                    _min_acceptable = int(self.follower_count * 0.99)
-                    if fc_int >= _min_acceptable or fc_int > self.follower_count:
-                        self.follower_count = fc_int
-                if fc_int > self.http_follow_last:
-                    self.http_follow_last = fc_int
-                    if self.verbose:
-                        logger.info(f"[HTTP Follow] http_follow_last={fc_int:,}")
-                self.follower_after = self.follower_count
-                logger.info(f"[HTTP Refresh] WS follower={self.ws_follow_last:,}, "
-                            f"HTML={fc_int:,}, follower_after={self.follower_after:,}, "
-                            f"http_delta={max(0, self.http_follow_last - self.http_follow_first):,}")
-            elif sec_uid:
-                # No HTML data — fall back to get_user_info API call
-                user_url = f"https://www.douyin.com/user/{sec_uid}"
-                with _suppress_stdout():
-                    user_info = DouyinAPI.get_user_info(auth, user_url)
-
-                if not isinstance(user_info, dict):
-                    logger.warning(f"[HTTP Recovery] get_user_info returned unexpected type: {type(user_info).__name__}")
-                    user_data = {}
-                else:
-                    user_data = user_info.get('user', {})
-                fc = user_data.get('follower_count', 0)
-                _fc_precision_loss = False
-                if isinstance(fc, str):
-                    if '万' in fc:
-                        _fc_precision_loss = True
-                        fc = float(fc.replace('万', '')) * 10000
-                    else:
-                        fc = float(fc)
-                fc_int = int(fc)
-                if _fc_precision_loss:
-                    logger.info(
-                        f"[HTTP Recovery] follower_count is 万-rounded "
-                        f"(\"{user_data.get('follower_count')}\") — "
-                        f"precision loss up to ±500"
-                    )
-                else:
-                    # Precise integer — track for HTTP-based follower delta
-                    # Baseline: capture the FIRST precise value seen this session.
-                    # Once set, NEVER lower it — the Douyin API fluctuates ±20-30
-                    # between calls (caching/server differences), which would
-                    # artificially shrink the delta if we reset to lower values.
-                    # Only http_follow_last should update (to the highest seen).
-                    if not getattr(self, '_http_first_seen', False):
-                        self._http_first_seen = True
-                        self.http_follow_first = fc_int
-                        # Also set http_follow_last to match on first capture
-                        if fc_int > self.http_follow_last:
-                            self.http_follow_last = fc_int
-                        if self.verbose:
-                            logger.info(f"[HTTP Follow] http_follow_first={fc_int:,} (first this session)")
-                    # Track the anchor's actual total follower count (authoritative).
-                    # Use smoothing to reject ±1% API noise while accepting real losses.
-                    if fc_int > 0:
-                        _min_acceptable = int(self.follower_count * 0.99)
-                        if fc_int >= _min_acceptable or fc_int > self.follower_count:
-                            self.follower_count = fc_int
-                    if fc_int > self.http_follow_last:
-                        self.http_follow_last = fc_int
-                        if self.verbose:
-                            logger.info(f"[HTTP Follow] http_follow_last={fc_int:,}")
-                # Use API value for follower_after (not WS followCount ordinal).
-                # The API is the authoritative source for the anchor's actual total.
-                self.follower_after = self.follower_count
-                logger.info(f"[HTTP Refresh] WS follower={self.ws_follow_last:,}, "
-                            f"API={fc_int:,}, follower_after={self.follower_after:,}, "
-                            f"http_delta={max(0, self.http_follow_last - self.http_follow_first):,}")
+            # ── Follower count via dedicated refresh ────────────────────
+            # Delegate to _refresh_follower_count() which is the canonical
+            # method.  Pass this call's sec_uid as override so the refresh
+            # works even if _http_room_info hasn't been populated yet.
+            _sec_uid = room_info.get('sec_uid', '')
+            self._refresh_follower_count(sec_uid_override=_sec_uid or None)
+            logger.info(f"[HTTP Refresh] WS follower={self.ws_follow_last:,}, "
+                        f"follower_count={self.follower_count:,}, "
+                        f"follower_after={self.follower_after:,}, "
+                        f"http_delta={max(0, self.http_follow_last - self.http_follow_first):,}")
             
             if mark_recovery:
                 self.http_cumulative_recovery = True
@@ -1173,58 +1089,26 @@ class LiveStatsRecorder:
                     self._callback(self)
 
     def _take_pre_snapshot(self, auth, room_info):
+        """Capture pre-stream snapshot: follower baseline + anchor nickname.
+
+        Delegates to `_refresh_follower_count()` for the API call (with retry)
+        and captures the first precise value as `follower_before`.  Also sets
+        `anchor_nickname` (from room_info fallback if API doesn't provide it).
+        """
         try:
             sec_uid = room_info.get('sec_uid', '')
             if sec_uid:
-                user_url = f"https://www.douyin.com/user/{sec_uid}"
+                # Canonical API call: retries up to 3× for a precise integer
+                self._refresh_follower_count(sec_uid_override=sec_uid)
 
-                # Retry the API up to 3 times if it returns 0 or 万-rounded.
-                # The WS SocialMessage followCount is the fallback if the
-                # API never returns a precise value.
-                _api_attempts = 0
-                _api_value = 0
-                _api_precision_loss = True
-
-                while _api_attempts < 3 and (_api_value == 0 or _api_precision_loss):
-                    _api_attempts += 1
-                    with _suppress_stdout():
-                        user_info = DouyinAPI.get_user_info(auth, user_url)
-                    user_data = user_info.get('user', {})
-                    if _api_attempts == 1:
-                        self.anchor_nickname = user_data.get('nickname', '')
-                    fc = user_data.get('follower_count', 0)
-                    _fc_precision_loss = False
-                    if isinstance(fc, str):
-                        if '万' in fc:
-                            _fc_precision_loss = True
-                            fc = float(fc.replace('万', '')) * 10000
-                        else:
-                            fc = float(fc)
-                    _api_value = int(fc) if fc else 0
-                    _api_precision_loss = _fc_precision_loss
-                    if _api_attempts < 3 and (_api_value == 0 or _api_precision_loss):
-                        time.sleep(1)  # brief pause between retries
-
-                # Use API value if a precise non-zero result was obtained
-                if self.follower_before == 0 and not _api_precision_loss and _api_value > 0:
-                    self.follower_before = _api_value
+                # First precise value seen this session → follower_before
+                if self.follower_before == 0 and self.http_follow_first > 0:
+                    self.follower_before = self.http_follow_first
                     if self.verbose:
                         logger.info(
-                            f"[StatsRecorder] follower_before={_api_value:,} "
-                            f"(from API /aweme/v1/web/user/profile/other/ "
-                            f"after {_api_attempts} attempt(s))"
+                            f"[StatsRecorder] follower_before={self.follower_before:,} "
+                            f"(from _refresh_follower_count)"
                         )
-                elif _api_precision_loss:
-                    logger.info(
-                        f"[StatsRecorder] API follower_count={_api_value:,} "
-                        f"(万-rounded after {_api_attempts} attempts — "
-                        f"WS SocialMessage will be used as fallback)"
-                    )
-                elif self.follower_before > 0:
-                    logger.debug(
-                        f"[StatsRecorder] API follower_count={_api_value:,} "
-                        f"(precise, but follower_before already set to {self.follower_before:,})"
-                    )
 
                 # Fan club baseline comes exclusively from the first
                 # WebcastFansclubMessage (type=2 join) total_members field.
@@ -1242,6 +1126,9 @@ class LiveStatsRecorder:
     def _take_post_snapshot(self, auth, fallback_sec_uid: str = ""):
         """Fetch current follower count from Douyin API and update follower_after.
 
+        Delegates to `_refresh_follower_count()` for the canonical API call
+        (with retry, max-stabilization, WS cross-check).
+
         Args:
             auth: DouyinAuth instance.
             fallback_sec_uid: If get_live_info fails or returns no sec_uid
@@ -1258,45 +1145,12 @@ class LiveStatsRecorder:
                 room_info = getattr(self, '_http_room_info', {})
             sec_uid = room_info.get('sec_uid', '') or fallback_sec_uid
             if sec_uid:
-                user_url = f"https://www.douyin.com/user/{sec_uid}"
-                with _suppress_stdout():
-                    user_info = DouyinAPI.get_user_info(auth, user_url)
-
-                user_data = user_info.get('user', {})
-                fc = user_data.get('follower_count', 0)
-                if isinstance(fc, str):
-                    fc = float(fc.replace('万', '')) * 10000 if '万' in fc else float(fc)
-                # Use API value for follower_after (authoritative).
-                # The WS followCount is an event ordinal, not the actual total.
-                fc_int = int(fc) if fc else 0
-                if fc_int > 0:
-                    self.follower_count = fc_int
-                self.follower_after = self.follower_count
+                # Canonical API call — handles retry, parsing, max(), WS x-check
+                self._refresh_follower_count(sec_uid_override=sec_uid)
                 if self.verbose:
                     logger.info(f"[StatsRecorder] Post-snapshot: followers={self.follower_after}, delta={self.follower_after - self.follower_before}")
         except Exception as e:
             logger.warning(f"[StatsRecorder] Post-snapshot failed: {e}")
-
-    def _get_follower(self, auth, sec_uid: str) -> int:
-        """Fetch the current follower count for a given sec_uid.
-
-        Direct API call — no get_live_info round-trip needed.
-        Returns 0 on failure.
-        """
-        try:
-            import sys
-            user_url = f"https://www.douyin.com/user/{sec_uid}"
-            with _suppress_stdout():
-                user_info = DouyinAPI.get_user_info(auth, user_url)
-
-            user_data = user_info.get('user', {})
-            fc = user_data.get('follower_count', 0)
-            if isinstance(fc, str):
-                fc = float(fc.replace('万', '')) * 10000 if '万' in fc else float(fc)
-            return int(fc)
-        except Exception as e:
-            logger.warning(f"[StatsRecorder] _get_follower failed for {sec_uid}: {e}")
-            return 0
 
     def _on_open(self, ws):
         logger.info(f"[StatsRecorder] WebSocket connected to room {self.live_id}")
@@ -2218,85 +2072,143 @@ class LiveStatsRecorder:
         staleness = (datetime.now() - self.ws_follow_last_time).total_seconds()
         return staleness > 300  # 5 min without any followCount update
 
-    def _refresh_follower_count(self):
-        """Periodically refresh the anchor's actual follower count from the HTTP API.
+    def _refresh_follower_count(self, sec_uid_override: str = None):
+        """Refresh the anchor's follower count from the HTTP API.
 
-        Called every 5 min from _periodic_summary().  Updates follower_count
-        and http_follow_last (highest seen).  Skips 万-rounded values to
-        avoid ±500 precision loss.
+        Canonical method for getting follower count — used both by the
+        5-minute periodic refresh (via _periodic_summary) and by
+        fetch_cumulative_via_http() (which passes its own sec_uid).
+        Updates:
+          - follower_count   (max-based — never decreases on API fluctuation)
+          - follower_after   (always follows follower_count)
+          - http_follow_first (first precise value seen this session)
+          - http_follow_last  (highest precise value seen)
+        Retries up to 3 times when the API returns a 万-rounded value
+        (precision loss up to ±500) to try to get a precise integer.
+        Cross-checks WS followCount to catch cases where WS shows more
+        new follows than the API delta (e.g. WS received events during
+        an API call gap).
         """
         try:
             from builder.auth import DouyinAuth
             auth = DouyinAuth()
             auth.perepare_auth(self.cookie_str, "", "")
-            sec_uid = getattr(self, '_http_room_info', {}).get('sec_uid', '')
-            if not sec_uid:
-                fallback = getattr(self, '_anchor_sec_uid', '')
-                # Try to get from the last http_room_info on the StreamMonitor
-                sec_uid = fallback or ''
+            sec_uid = (sec_uid_override
+                       or getattr(self, '_http_room_info', {}).get('sec_uid', '')
+                       or getattr(self, '_anchor_sec_uid', ''))
             if not sec_uid:
                 return
             user_url = f"https://www.douyin.com/user/{sec_uid}"
-            with _suppress_stdout():
-                user_info = DouyinAPI.get_user_info(auth, user_url)
-            if not isinstance(user_info, dict):
-                return
-            user_data = user_info.get('user', {})
-            fc = user_data.get('follower_count', 0)
-            if not fc:
-                return
-            _fc_precision_loss = False
-            if isinstance(fc, str):
-                if '万' in fc:
-                    _fc_precision_loss = True
-                    fc = float(fc.replace('万', '')) * 10000
-                else:
-                    fc = float(fc)
-            if _fc_precision_loss:
-                logger.debug(f"[FollowerRefresh] Skipped 万-rounded value: {fc:,.0f}")
-                return
-            fc_int = int(fc)
-            # ── Follower count smoothing ──────────────────────────────────
-            # The Douyin API fluctuates ±20-30 between calls (cache/server
-            # differences).  Direct assignment makes http_delta dip on every
-            # refresh.  Use a "decaying max" approach:
-            #   - Accept any value >= 99% of current (tolerates ±1% noise)
-            #   - Accept any value > current (monotonic growth)
-            #   - Reject small drops <= 1% (API noise, not real)
-            #   - Reject 0 (API failure — keep last known value)
-            _FOLLOWER_SMOOTHING_THRESHOLD = 0.99
-            if fc_int > 0:
-                _min_acceptable = int(self.follower_count * _FOLLOWER_SMOOTHING_THRESHOLD)
-                if fc_int >= _min_acceptable or fc_int > self.follower_count:
-                    self.follower_count = fc_int
-                elif self.verbose:
-                    logger.debug(
-                        f"[FollowerRefresh] Rejected small drop: "
-                        f"{fc_int:,} < threshold {_min_acceptable:,} "
-                        f"(current={self.follower_count:,})"
+
+            # Retry up to 3 times to get a precise (non-万) follower count.
+            # The Douyin API /aweme/v1/web/user/profile/other/ endpoint
+            # sometimes returns 万-rounded values for high-follower accounts;
+            # retrying with a brief pause often yields a precise integer.
+            _api_attempts = 0
+            _api_value = 0
+            _api_precision_loss = True
+            _last_user_data = {}
+            while _api_attempts < 3 and (_api_value == 0 or _api_precision_loss):
+                _api_attempts += 1
+                with _suppress_stdout():
+                    user_info = DouyinAPI.get_user_info(auth, user_url)
+                if not isinstance(user_info, dict):
+                    if _api_attempts < 3:
+                        time.sleep(1)
+                    continue
+                _last_user_data = user_info.get('user', {})
+                fc = _last_user_data.get('follower_count', 0)
+                if not fc:
+                    if _api_attempts < 3:
+                        time.sleep(1)
+                    continue
+                _fc_precision_loss = False
+                if isinstance(fc, str):
+                    if '万' in fc:
+                        _fc_precision_loss = True
+                        fc = float(fc.replace('万', '')) * 10000
+                    else:
+                        fc = float(fc)
+                _api_value = int(fc) if fc else 0
+                _api_precision_loss = _fc_precision_loss
+                if _api_attempts < 3 and (_api_value == 0 or _api_precision_loss):
+                    time.sleep(1)  # brief pause between retries
+
+            if _api_precision_loss or _api_value == 0:
+                if _api_precision_loss:
+                    logger.info(
+                        f"[FollowerRefresh] follower_count is 万-rounded "
+                        f"({_api_value:,} after {_api_attempts} attempts) — "
+                        f"skipping to avoid ±500 precision loss"
                     )
-            # Track highest seen separately for peak analysis (no smoothing)
-            if fc_int > self.http_follow_last:
-                self.http_follow_last = fc_int
+                return
+            # ── First precise value this session ─────────────────────────
+            # Captured once and never lowered — the Douyin API fluctuates
+            # ±20-30 between calls, which would artificially shrink the
+            # follower delta if we reset http_follow_first to lower values.
+            if not getattr(self, '_http_first_seen', False):
+                self._http_first_seen = True
+                self.http_follow_first = _api_value
+                if _api_value > self.http_follow_last:
+                    self.http_follow_last = _api_value
+                # Capture anchor nickname from the first API response
+                if _last_user_data.get('nickname'):
+                    self.anchor_nickname = _last_user_data['nickname']
+                if self.verbose:
+                    logger.info(f"[FollowerRefresh] http_follow_first={_api_value:,} (first this session)")
+            # ── Follower count (max-stabilized) ──────────────────────────
+            # The Douyin API fluctuates ±20-30 between calls for the same
+            # follower count (caching/server differences).  Using max()
+            # prevents follower_count from bouncing down on transient dips,
+            # giving a stable view of actual follower growth.
+            # Real unfollows large enough to matter (>0.1% of total) will
+            # still be captured on the next interval.
+            if _api_value > 0 and _api_value > self.follower_count:
+                self.follower_count = _api_value
+            # ── Cross-check with WS followCount ──────────────────────────
+            # The WS SocialMessage.followCount provides precise real-time
+            # per-event data.  When WS shows more total growth than the
+            # API returned (e.g., WS captured follows during an API call
+            # gap), prefer the WS-based estimate.
+            if (self.ws_follow_first > 0 and self.ws_follow_last > 0
+                    and self.follower_before > 0
+                    and not self._ws_follow_stalled()):
+                _ws_estimate = self.follower_before + max(
+                    0, self.ws_follow_last - self.ws_follow_first
+                )
+                if _ws_estimate > self.follower_count:
+                    self.follower_count = _ws_estimate
+                    if self.verbose:
+                        logger.info(f"[FollowerRefresh] WS cross-check: {_ws_estimate:,} > API ({_api_value:,})")
+            # Track highest API value seen (pure max — used for diagnostics)
+            if _api_value > self.http_follow_last:
+                self.http_follow_last = _api_value
+                if self.verbose:
+                    logger.info(f"[FollowerRefresh] http_follow_last={_api_value:,}")
+            # follower_after always follows the authoritative estimate
+            self.follower_after = self.follower_count
             if self.verbose:
-                logger.info(f"[FollowerRefresh] follower_count={fc_int:,} (delta={self._get_new_follows():,})")
+                logger.info(f"[FollowerRefresh] follower_count={self.follower_count:,} "
+                            f"(API={_api_value:,}, delta={self._get_new_follows():,})")
         except Exception as e:
             logger.warning(f"[FollowerRefresh] Failed: {e}")
 
     def _get_new_follows(self) -> int:
-        """New followers — HTTP API authoritative, WS supplements in real-time.
+        """New followers — follower_before is the authoritative baseline.
+
+        Uses follower_before (set once by pre-snapshot or seed override) as
+        the authoritative baseline.  Falls back to http_follow_first or
+        ws_follow_first if follower_before hasn't been captured yet.
 
         max(http_delta, ws_delta) ensures:
           - HTTP captures the authoritative total periodically (every 5 min)
           - WS captures individual follow events in real-time between HTTP refreshes
           - If WS followCount stalls (>5 min without update), WS delta is dropped
             and only HTTP is used until WS recovers.
-
-        The baseline for HTTP delta is http_follow_first (first precise API value)
-        if available, which is immune to the ±500 万-rounding error.  Falls back
-        to follower_before if no precise value has been captured yet.
         """
-        baseline = self.http_follow_first if self.http_follow_first > 0 else self.ws_follow_first
+        baseline = (self.follower_before if self.follower_before > 0
+                    else self.http_follow_first if self.http_follow_first > 0
+                    else self.ws_follow_first)
         http_delta = max(0, self.follower_count - baseline)
         ws_delta = 0
         if not self._ws_follow_stalled():
@@ -2463,26 +2375,6 @@ class DouyinLiveChecker:
                 k, v = part.split("=", 1)
                 result[k.strip()] = v.strip()
         return result
-
-    @staticmethod
-    def _parse_follower_count(anchor_info: dict) -> int:
-        """Extract and normalize followerCount from an anchor info dict.
-        Handles integer, float, and Chinese-number string formats.
-        Returns 0 if unparseable or missing.
-        """
-        fc = anchor_info.get('followerCount', 0)
-        if not fc:
-            return 0
-        if isinstance(fc, str):
-            if '万' in fc:
-                return int(float(fc.replace('万', '')) * 10000)
-            try:
-                return int(float(fc))
-            except (ValueError, TypeError):
-                return 0
-        if isinstance(fc, (int, float)):
-            return int(fc)
-        return 0
 
     def _check_status_via_api(self) -> dict | None:
         """Check live status via the official /webcast/room/web/enter/ API.
@@ -2723,8 +2615,6 @@ class DouyinLiveChecker:
                             sec_uid = anchor_info.get('sec_uid', '')
                             nickname = anchor_info.get('nickname', '')
                             user_id = str(anchor_info.get('id_str', ''))
-                            follower_count = self._parse_follower_count(anchor_info)
-                            logger.info(f"[Fallback] RENDER_DATA room: status={status}, title={title}, followers={follower_count:,}")
                             return {
                                 "room_id": rid,
                                 "user_id": user_id,
@@ -2735,7 +2625,7 @@ class DouyinLiveChecker:
                                 "room_status": status,
                                 "room_title": title,
                                 "anchor_nickname": nickname,
-                                "follower_count": follower_count,
+                                "follower_count": 0,
                             }
                     except Exception as e:
                         logger.debug(f"[Fallback] RENDER_DATA parse failed: {e}")
@@ -2769,8 +2659,6 @@ class DouyinLiveChecker:
                                 sec_uid = anchor.get('sec_uid', '')
                                 nickname = anchor.get('nickname', '')
                                 user_id = str(anchor.get('id_str', ''))
-                                follower_count = self._parse_follower_count(anchor)
-                                logger.info(f"[Fallback] __INITIAL_STATE__ room: status={status}, title={title}, followers={follower_count:,}")
                                 return {
                                     "room_id": rid,
                                     "user_id": user_id,
@@ -2781,7 +2669,7 @@ class DouyinLiveChecker:
                                     "room_status": status,
                                     "room_title": title,
                                     "anchor_nickname": nickname,
-                                    "follower_count": follower_count,
+                                    "follower_count": 0,
                                 }
                     except Exception as e:
                         logger.debug(f"[Fallback] __INITIAL_STATE__ parse failed: {e}")
