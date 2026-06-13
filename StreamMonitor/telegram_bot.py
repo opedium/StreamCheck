@@ -147,6 +147,9 @@ class TelegramBot:
         auth = DouyinAuth()
         auth.cookie = cookies1
         auth.cookie_str = _cookie_dict_to_str(cookies1)
+        if "msToken" not in auth.cookie:
+            from utils.dy_util import generate_msToken as _gmt
+            auth.cookie["msToken"] = _gmt()
         print(f"[TGBot] douyin.com OK — {len(cookies1)} cookies", flush=True)
 
         # Step 2: Use DYLoginApi to request QR code
@@ -187,6 +190,10 @@ class TelegramBot:
             auth2 = DouyinAuth()
             auth2.cookie = cookies2
             auth2.cookie_str = _cookie_dict_to_str(cookies2)
+            # Ensure msToken is present — dyGenerateQRcode reads it directly
+            if "msToken" not in auth2.cookie:
+                from utils.dy_util import generate_msToken as _gmt
+                auth2.cookie["msToken"] = _gmt()
             print(f"[TGBot] SSO visit OK — {len(cookies2)} cookies", flush=True)
 
             try:
