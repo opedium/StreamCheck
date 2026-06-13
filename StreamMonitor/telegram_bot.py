@@ -23,6 +23,9 @@ from telegram_notifier import TelegramNotifier
 
 _SSO_BASE = "https://sso.douyin.com/"
 
+# Domains the QR/SSO flow uses — redirecting away means scan succeeded
+_QR_DOMAINS = ["sso.douyin.com", "amemv.com", "login_page"]
+
 
 def _sso_query() -> dict:
     msToken = generate_msToken()
@@ -166,20 +169,25 @@ class TelegramBot:
                 self.send_photo(cid, buf.getvalue(),
                     caption="Douyin QR Login\nScan with Douyin app.\nPolling 5 min...")
 
-                # Navigate to the QR display URL — this page is tied to this
-                # specific token.  When the user scans, the SSO redirects the
-                # page away from sso.douyin.com to www.douyin.com, which we
-                # detect by watching the URL.
+                # Navigate to the QR display URL.  When user scans, the SSO
+                # redirects the page to www.douyin.com — we detect this by
+                # watching for the URL to leave the QR/SSO domains.
                 await page.goto(qr_url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2000)
 
                 print("[TGBot] Watching for redirect...", flush=True)
                 for i in range(60):
                     await asyncio.sleep(5)
                     try:
                         current = page.url
-                        # Check if redirected away from SSO domain
-                        if "douyin.com" in current and "sso." not in current and "login_page" not in current:
+                        # If none of the QR/SSO domains are in the URL,
+                        # the redirect happened (scan successful).
+                        if not any(d in current for d in _QR_DOMAINS):
                             self.send_message(cid, "QR scanned! Saving cookies...")
+                            # Navigate to douyin.com to ensure cookies are set
+                            await page.goto("https://www.douyin.com/",
+                                            wait_until="domcontentloaded", timeout=15000)
+                            await page.wait_for_timeout(3000)
                             break
                         print(f"[TGBot] URL {i*5}s: {current[:80]}", flush=True)
                     except Exception as e:
