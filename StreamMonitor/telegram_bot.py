@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Telegram bot — /refresh_douyin via Playwright QR screenshot."""
+"""Telegram bot — /refresh_douyin via SSO QR + background thread."""
 
 import asyncio
+import io
+import json as _json
 import os
 import sys
 import threading
 import time
 import traceback
 
+import qrcode
 import requests
 
 _dy_path = os.path.join(os.path.dirname(__file__), "..", "Douyin_Spider")
@@ -15,8 +18,35 @@ _dy_path = os.path.abspath(_dy_path)
 if _dy_path not in sys.path:
     sys.path.insert(0, _dy_path)
 
+from builder.params import Params
 from utils.dy_util import generate_msToken
 from telegram_notifier import TelegramNotifier
+
+_SSO_BASE = "https://sso.douyin.com/"
+
+
+def _sso_query() -> dict:
+    msToken = generate_msToken()
+    p = Params()
+    p.add_param("service", "https://www.douyin.com")
+    p.add_param("need_logo", "false")
+    p.add_param("need_short_url", "false")
+    p.add_param("passport_jssdk_version", "1.0.26")
+    p.add_param("passport_jssdk_type", "pro")
+    p.add_param("aid", "6383")
+    p.add_param("language", "zh")
+    p.add_param("account_sdk_source", "sso")
+    p.add_param("device_platform", "web_app")
+    p.add_param("msToken", msToken)
+    p.with_a_bogus()
+    return p.get()
+
+
+def _build_url(base: str, query: dict, extra: dict = None) -> str:
+    q = dict(query)
+    if extra:
+        q.update(extra)
+    return base + "?" + "&".join(f"{k}={v}" for k, v in q.items())
 
 
 class TelegramBot:
@@ -32,8 +62,7 @@ class TelegramBot:
             sys.exit(1)
         self._offset = 0
         self._poll_timeout = 30
-        self._qr_sessions = {}  # cid -> ctx (Playwright context)
-        self._lock = threading.Lock()
+        self._qr_sessions = {}
 
     def _api(self, method, **kw):
         url = f"https://api.telegram.org/bot{self.token}/{method}"
@@ -65,54 +94,69 @@ class TelegramBot:
                   data={"chat_id": cid, "caption": caption})
 
     def _show_qr(self, cid):
-        """Run Playwright in a background thread, show QR, wait for done signal."""
+        """Playwright → SSO QR → send to Telegram → wait for done."""
         async def _run():
             from playwright.async_api import async_playwright
 
             async with async_playwright() as pw:
                 ctx = await pw.chromium.launch_persistent_context(
-                    user_data_dir="/tmp/tgbot_chrome", headless=True,
+                    user_data_dir=f"/tmp/tgbot_qr_{cid}", headless=True,
                     viewport={"width": 1280, "height": 720},
                     user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                 "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
                     args=["--disable-blink-features=AutomationControlled"],
                 )
                 page = await ctx.new_page()
-                await page.goto("https://www.douyin.com/user/self",
+                await page.goto("https://www.douyin.com/",
                                 wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(3000)
 
-                raw_cookies = {c["name"]: c["value"] for c in await ctx.cookies()}
-                if "sessionid" in raw_cookies:
-                    self.send_message(cid, "Already logged in")
+                # Intercept SSO QR response
+                qr_data = {}
+                async def on_resp(resp):
+                    if "get_qrcode" in resp.url and resp.ok:
+                        try:
+                            j = await resp.json()
+                            if j.get("data", {}).get("qrcode_index_url"):
+                                qr_data.update(j)
+                                print("[TGBot] QR intercepted", flush=True)
+                        except Exception:
+                            pass
+                page.on("response", on_resp)
+
+                sso_url = _build_url(_SSO_BASE + "get_qrcode/", _sso_query())
+                await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(5000)
+                if not qr_data:
+                    await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(5000)
+                if not qr_data:
+                    self.send_message(cid, "No QR data from SSO")
                     await ctx.close()
                     return
 
-                try:
-                    btn = page.locator("text=扫码登录")
-                    await btn.wait_for(timeout=5000)
-                    await btn.click()
-                    await page.wait_for_timeout(3000)
-                except Exception as e:
-                    print(f"[TGBot] QR click: {e}", flush=True)
+                qr_url = qr_data["data"]["qrcode_index_url"]
+                print(f"[TGBot] QR OK url={qr_url[:60]}...", flush=True)
 
-                screenshot = await page.screenshot(type="png")
-                self.send_photo(cid, screenshot,
+                # Generate QR image from the URL using qrcode library
+                img = qrcode.make(qr_url)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                buf.seek(0)
+                self.send_photo(cid, buf.getvalue(),
                     caption="Scan QR with Douyin app, then send:\n/refresh_douyin_done")
 
-                with self._lock:
-                    self._qr_sessions[cid] = ctx
+                self._qr_sessions[cid] = ctx
+                print(f"[TGBot] QR session started for {cid}", flush=True)
 
-                # Wait until done signal or timeout (10 min)
+                # Wait for done signal (up to 10 min)
                 for _ in range(120):
                     await asyncio.sleep(5)
-                    with self._lock:
-                        if cid not in self._qr_sessions:
-                            return  # removed by _handle_done
+                    if cid not in self._qr_sessions:
+                        return
                 self.send_message(cid, "QR session timed out")
                 await ctx.close()
-                with self._lock:
-                    self._qr_sessions.pop(cid, None)
+                self._qr_sessions.pop(cid, None)
 
         asyncio.run(_run())
 
@@ -122,9 +166,7 @@ class TelegramBot:
         t.start()
 
     def _handle_done(self, cid):
-        with self._lock:
-            ctx = self._qr_sessions.pop(cid, None)
-
+        ctx = self._qr_sessions.pop(cid, None)
         if not ctx:
             self.send_message(cid, "No active QR session. Send /refresh_douyin first.")
             return
@@ -136,7 +178,6 @@ class TelegramBot:
             await page.goto("https://www.douyin.com/",
                             wait_until="domcontentloaded", timeout=15000)
             await page.wait_for_timeout(3000)
-
             raw = await ctx.cookies()
             cookies = {c["name"]: c["value"] for c in raw}
             if "msToken" not in cookies:
@@ -154,7 +195,6 @@ class TelegramBot:
             d["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             d["refresh_count"] = d.get("refresh_count", 0) + 1
             DouyinCookieManager().save(d)
-
             self.send_message(cid, f"Douyin QR OK — {len(cookies)} cookies saved")
 
         asyncio.run(_save())
