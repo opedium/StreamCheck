@@ -32,7 +32,6 @@ class TelegramBot:
             sys.exit(1)
         self._offset = 0
         self._poll_timeout = 30
-        # Track active QR sessions: chat_id -> (page, ctx)
         self._qr_sessions = {}
 
     def _api(self, method, **kw):
@@ -72,13 +71,6 @@ class TelegramBot:
             self.send_message(cid, "Playwright not installed")
             return
 
-        old = ""
-        try:
-            from cookies import DouyinCookieManager
-            old = DouyinCookieManager().load().get("cookie_str", "")
-        except Exception:
-            pass
-
         async def _run():
             async with async_playwright() as pw:
                 ctx = await pw.chromium.launch_persistent_context(
@@ -88,38 +80,40 @@ class TelegramBot:
                                 "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
                     args=["--disable-blink-features=AutomationControlled"],
                 )
-                # Don't seed old cookies — we want the QR login page to appear
-                # so the user can scan and get fresh cookies.
                 page = await ctx.new_page()
 
-                # Visit user/self — shows QR if logged out, profile if logged in
                 await page.goto("https://www.douyin.com/user/self",
                                 wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(5000)
 
-                # Check if already logged in — sessionid cookie means valid session
+                # Check if logged in
                 raw_cookies = {c["name"]: c["value"] for c in await ctx.cookies()}
                 if "sessionid" in raw_cookies:
-                    self.send_message(cid, "Already logged in — cookies still valid")
+                    self.send_message(cid, "Already logged in")
                     await ctx.close()
                     return
 
-                # QR login page is shown — screenshot and send
+                # Click the QR login button to reveal the QR code
+                try:
+                    btn = page.locator("text=扫码登录")
+                    await btn.wait_for(timeout=5000)
+                    await btn.click()
+                    await page.wait_for_timeout(3000)
+                    print("[TGBot] Clicked QR login button", flush=True)
+                except Exception as e:
+                    print(f"[TGBot] QR button click: {e}", flush=True)
+
                 screenshot = await page.screenshot(type="png")
                 self.send_photo(cid, screenshot,
-                    caption="Scan this QR with the Douyin app, then send:\n/refresh_douyin_done")
+                    caption="Scan QR with Douyin app, then send:\n/refresh_douyin_done")
 
-                # Store session for later retrieval
                 self._qr_sessions[cid] = (page, ctx)
                 print(f"[TGBot] QR session started for {cid}", flush=True)
 
-                # Wait for the done command (checked in main loop)
-                # The browser stays open until done or timeout
-                for _ in range(120):  # 10 minutes max
+                for _ in range(120):
                     await asyncio.sleep(5)
                     if cid not in self._qr_sessions:
-                        return  # session was cleaned up
-                # Timeout — close session
+                        return
                 self.send_message(cid, "QR session timed out")
                 await ctx.close()
                 self._qr_sessions.pop(cid, None)
@@ -131,7 +125,6 @@ class TelegramBot:
             self._qr_sessions.pop(cid, None)
 
     async def _handle_done(self, cid):
-        """Extract cookies from the QR session and save."""
         if cid not in self._qr_sessions:
             self.send_message(cid, "No active QR session. Send /refresh_douyin first.")
             return
@@ -140,7 +133,6 @@ class TelegramBot:
         self.send_message(cid, "Saving cookies...")
 
         try:
-            # Navigate to douyin.com to ensure cookies are set
             await page.goto("https://www.douyin.com/",
                             wait_until="domcontentloaded", timeout=15000)
             await page.wait_for_timeout(3000)
@@ -165,7 +157,7 @@ class TelegramBot:
 
             self.send_message(cid, f"Douyin QR OK — {len(cookies)} cookies saved")
         except Exception as e:
-            self.send_message(cid, f"Error saving cookies: {e}")
+            self.send_message(cid, f"Error: {e}")
             await ctx.close()
 
     def run(self):
@@ -173,7 +165,7 @@ class TelegramBot:
         self.send_message(self.chat_id,
             "Cookie bot online\n"
             "/refresh_douyin — get QR code\n"
-            "/refresh_douyin_done — save cookies after scanning")
+            "/refresh_douyin_done — save cookies after scan")
 
         while True:
             try:
