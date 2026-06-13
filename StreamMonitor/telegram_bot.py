@@ -2,9 +2,9 @@
 """Telegram bot — /refresh_douyin via Playwright QR screenshot."""
 
 import asyncio
-import io
 import os
 import sys
+import threading
 import time
 import traceback
 
@@ -32,7 +32,8 @@ class TelegramBot:
             sys.exit(1)
         self._offset = 0
         self._poll_timeout = 30
-        self._qr_sessions = {}
+        self._qr_sessions = {}  # cid -> ctx (Playwright context)
+        self._lock = threading.Lock()
 
     def _api(self, method, **kw):
         url = f"https://api.telegram.org/bot{self.token}/{method}"
@@ -63,15 +64,11 @@ class TelegramBot:
                   files={"photo": ("qr.png", data, "image/png")},
                   data={"chat_id": cid, "caption": caption})
 
-    def _handle_refresh_douyin(self, cid):
-        self.send_message(cid, "Launching browser...")
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            self.send_message(cid, "Playwright not installed")
-            return
-
+    def _show_qr(self, cid):
+        """Run Playwright in a background thread, show QR, wait for done signal."""
         async def _run():
+            from playwright.async_api import async_playwright
+
             async with async_playwright() as pw:
                 ctx = await pw.chromium.launch_persistent_context(
                     user_data_dir="/tmp/tgbot_chrome", headless=True,
@@ -81,58 +78,61 @@ class TelegramBot:
                     args=["--disable-blink-features=AutomationControlled"],
                 )
                 page = await ctx.new_page()
-
                 await page.goto("https://www.douyin.com/user/self",
                                 wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(5000)
 
-                # Check if logged in
                 raw_cookies = {c["name"]: c["value"] for c in await ctx.cookies()}
                 if "sessionid" in raw_cookies:
                     self.send_message(cid, "Already logged in")
                     await ctx.close()
                     return
 
-                # Click the QR login button to reveal the QR code
                 try:
                     btn = page.locator("text=扫码登录")
                     await btn.wait_for(timeout=5000)
                     await btn.click()
                     await page.wait_for_timeout(3000)
-                    print("[TGBot] Clicked QR login button", flush=True)
                 except Exception as e:
-                    print(f"[TGBot] QR button click: {e}", flush=True)
+                    print(f"[TGBot] QR click: {e}", flush=True)
 
                 screenshot = await page.screenshot(type="png")
                 self.send_photo(cid, screenshot,
                     caption="Scan QR with Douyin app, then send:\n/refresh_douyin_done")
 
-                self._qr_sessions[cid] = (page, ctx)
-                print(f"[TGBot] QR session started for {cid}", flush=True)
+                with self._lock:
+                    self._qr_sessions[cid] = ctx
 
+                # Wait until done signal or timeout (10 min)
                 for _ in range(120):
                     await asyncio.sleep(5)
-                    if cid not in self._qr_sessions:
-                        return
+                    with self._lock:
+                        if cid not in self._qr_sessions:
+                            return  # removed by _handle_done
                 self.send_message(cid, "QR session timed out")
                 await ctx.close()
-                self._qr_sessions.pop(cid, None)
+                with self._lock:
+                    self._qr_sessions.pop(cid, None)
 
-        try:
-            asyncio.run(_run())
-        except Exception as e:
-            self.send_message(cid, f"Error: {e}")
-            self._qr_sessions.pop(cid, None)
+        asyncio.run(_run())
 
-    async def _handle_done(self, cid):
-        if cid not in self._qr_sessions:
+    def _handle_refresh_douyin(self, cid):
+        self.send_message(cid, "Launching browser...")
+        t = threading.Thread(target=self._show_qr, args=(cid,), daemon=True)
+        t.start()
+
+    def _handle_done(self, cid):
+        with self._lock:
+            ctx = self._qr_sessions.pop(cid, None)
+
+        if not ctx:
             self.send_message(cid, "No active QR session. Send /refresh_douyin first.")
             return
 
-        page, ctx = self._qr_sessions.pop(cid)
         self.send_message(cid, "Saving cookies...")
 
-        try:
+        async def _save():
+            page = await ctx.new_page()
             await page.goto("https://www.douyin.com/",
                             wait_until="domcontentloaded", timeout=15000)
             await page.wait_for_timeout(3000)
@@ -156,9 +156,8 @@ class TelegramBot:
             DouyinCookieManager().save(d)
 
             self.send_message(cid, f"Douyin QR OK — {len(cookies)} cookies saved")
-        except Exception as e:
-            self.send_message(cid, f"Error: {e}")
-            await ctx.close()
+
+        asyncio.run(_save())
 
     def run(self):
         print("[TGBot] Starting...", flush=True)
@@ -178,7 +177,7 @@ class TelegramBot:
                     if text == "/refresh_douyin":
                         self._handle_refresh_douyin(cid)
                     elif text == "/refresh_douyin_done":
-                        asyncio.run(self._handle_done(cid))
+                        self._handle_done(cid)
                     else:
                         self.send_message(cid, f"Unknown: {text}")
             except Exception as e:
