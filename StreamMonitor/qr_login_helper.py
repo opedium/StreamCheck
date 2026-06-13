@@ -31,7 +31,7 @@ if _dy_path not in sys.path:
 from builder.auth import DouyinAuth
 from builder.header import HeaderBuilder, HeaderType
 from builder.params import Params
-from utils.dy_util import generate_signature
+from utils.dy_util import generate_signature, generate_msToken
 
 from telegram_notifier import TelegramNotifier
 
@@ -85,8 +85,13 @@ def _sso_build_params(auth: DouyinAuth, extra: dict = None) -> Params:
     params.add_param("passport_ztsdk", "3.0.20")
     params.add_param("passport_verify", "1.0.17")
     params.add_param("device_platform", "web_app")
-    if "msToken" in auth.cookie:
-        params.add_param("msToken", auth.cookie["msToken"])
+    # msToken is required by the SSO endpoint — generate a fresh one if
+    # the stored cookie doesn't have one (it's short-lived and often absent).
+    _msToken = auth.cookie.get("msToken", "")
+    if not _msToken:
+        _msToken = generate_msToken()
+        auth.cookie["msToken"] = _msToken
+    params.add_param("msToken", _msToken)
     params.with_a_bogus()
     return params
 
