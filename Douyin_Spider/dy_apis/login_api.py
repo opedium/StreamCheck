@@ -35,7 +35,7 @@ class DYLoginApi:
             await page.wait_for_load_state("load")
             await asyncio.sleep(10)
             # 获取localStorage的security-sdk/s_sdk_crypt_sdk
-            keys_str = await page.evaluate('localStorage["security-sdk/s_sdk_crypt_sdk"]')
+            keys_str = await page.evaluate('localStorage["security-sdk/s_sdk_crypt_sdk"]') or ''
             # web_protect_str = await page.evaluate('localStorage["security-sdk/s_sdk_sign_data_key/web_protect"]')
             web_protect_str = ''
             auth = DouyinAuth()
