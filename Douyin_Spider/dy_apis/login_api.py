@@ -45,7 +45,9 @@ class DYLoginApi:
                 cookies[cookie['name']] = cookie['value']
             await browser.close()
             auth.perepare_auth('', web_protect_str, keys_str)
-            auth.cookie = cookies
+            auth.cookie.update(cookies)
+            if "msToken" not in auth.cookie:
+                auth.cookie["msToken"] = auth.msToken
             return auth
 
     # 获取二维码
