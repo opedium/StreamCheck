@@ -143,7 +143,6 @@ class TelegramBot:
                             pass
                 page.on("response", on_resp)
 
-                # Request QR via SSO
                 sso_url = _build_url(_SSO_BASE + "get_qrcode/", _sso_query())
                 await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(5000)
@@ -151,16 +150,15 @@ class TelegramBot:
                     await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
                     await page.wait_for_timeout(5000)
                 if not qr_data:
-                    self.send_message(cid, "No QR data from SSO")
+                    self.send_message(cid, "No QR data")
                     await ctx.close()
                     return
 
                 token = qr_data["data"]["token"]
                 qr_url = qr_data["data"]["qrcode_index_url"]
-                redirect_url = qr_data["data"].get("redirect_url", "")
                 print(f"[TGBot] QR OK token={token[:20]}...", flush=True)
 
-                # Send QR to Telegram
+                # Generate QR and send to Telegram
                 img = qrcode.make(qr_url)
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
@@ -168,22 +166,22 @@ class TelegramBot:
                 self.send_photo(cid, buf.getvalue(),
                     caption="Douyin QR Login\nScan with Douyin app.\nPolling 5 min...")
 
-                # Instead of polling check_qrconnect (blocked by anti-bot),
-                # navigate to the login_page URL and watch for a redirect.
-                # After scan, the SSO redirects back to douyin.com with cookies.
-                login_page_url = f"https://www.douyin.com/login_page?service=https%3A%2F%2Fwww.douyin.com"
-                await page.goto(login_page_url, wait_until="domcontentloaded", timeout=30000)
+                # Navigate to the QR display URL — this page is tied to this
+                # specific token.  When the user scans, the SSO redirects the
+                # page away from sso.douyin.com to www.douyin.com, which we
+                # detect by watching the URL.
+                await page.goto(qr_url, wait_until="domcontentloaded", timeout=30000)
 
                 print("[TGBot] Watching for redirect...", flush=True)
                 for i in range(60):
                     await asyncio.sleep(5)
                     try:
                         current = page.url
-                        print(f"[TGBot] URL check {i*5}s: {current[:80]}", flush=True)
-                        # If redirected away from login_page to douyin.com, scan succeeded
-                        if "login_page" not in current and "sso.douyin.com" not in current:
+                        # Check if redirected away from SSO domain
+                        if "douyin.com" in current and "sso." not in current and "login_page" not in current:
                             self.send_message(cid, "QR scanned! Saving cookies...")
                             break
+                        print(f"[TGBot] URL {i*5}s: {current[:80]}", flush=True)
                     except Exception as e:
                         print(f"[TGBot] URL err ({i*5}s): {e}", flush=True)
                         continue
@@ -232,8 +230,6 @@ class TelegramBot:
                         continue
                     if text == "/refresh_douyin":
                         self._handle_refresh_douyin(cid)
-                    else:
-                        self.send_message(cid, f"Unknown: {text}")
             except Exception as e:
                 print(f"[TGBot] Loop: {e}", flush=True)
                 traceback.print_exc()
