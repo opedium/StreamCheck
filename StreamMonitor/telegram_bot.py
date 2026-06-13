@@ -119,7 +119,6 @@ def _chromium_bootstrap(old_cookie_str: str) -> dict | None:
             ctx = await pw.chromium.launch_persistent_context(
                 user_data_dir=PROFILE,
                 headless=True,
-                channel="chrome",
                 viewport={"width": 1920, "height": 1080},
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
