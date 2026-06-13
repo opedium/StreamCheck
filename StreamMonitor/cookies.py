@@ -1161,7 +1161,9 @@ async def _refresher_loop(platform: str, interval: int | None = None):
     print(f"[{platform}] Running initial refresh...", flush=True)
     await refresher.refresh()
 
-    POLL = 60  # wake every 60s to check health + keepalive
+    POLL = 60          # wake every 60s to check health + keepalive
+    KA_FAILS = 0       # consecutive keepalive failures (guard against flapping)
+    KA_FAIL_LIMIT = 3  # trigger refresh only after N consecutive failures
 
     while True:
         # Sleep in short increments so we can detect health=expired
@@ -1175,17 +1177,24 @@ async def _refresher_loop(platform: str, interval: int | None = None):
             # Active keepalive check — test the cookie against the
             # platform's API.  This catches silent expiry faster than
             # waiting for streammonitor or a posting failure.
+            # Uses a consecutive-failure threshold to avoid triggering
+            # an expensive Playwright refresh on transient network blips.
             if cookie_str:
                 alive = await refresher.keepalive.check(cookie_str)
                 if not alive:
-                    print(
-                        f"[{platform}] Keepalive FAILED — "
-                        f"marking unhealthy and refreshing",
-                        flush=True,
-                    )
-                    refresher.manager.mark_unhealthy()
-                    await refresher.refresh()
-                    break  # restart the interval timer
+                    KA_FAILS += 1
+                    if KA_FAILS >= KA_FAIL_LIMIT:
+                        print(
+                            f"[{platform}] Keepalive failed "
+                            f"{KA_FAILS}x consecutively — refreshing",
+                            flush=True,
+                        )
+                        KA_FAILS = 0
+                        refresher.manager.mark_unhealthy()
+                        await refresher.refresh()
+                        break  # restart the interval timer
+                else:
+                    KA_FAILS = 0  # reset on success
 
             # Passive check — streammonitor or another process marked
             # the cookie expired via mark_unhealthy().
@@ -1195,6 +1204,7 @@ async def _refresher_loop(platform: str, interval: int | None = None):
                     f"forcing immediate refresh",
                     flush=True,
                 )
+                KA_FAILS = 0
                 await refresher.refresh()
                 break  # restart the interval timer from zero
         else:
