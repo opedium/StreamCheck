@@ -393,18 +393,46 @@ class KeepaliveChecker:
             return False
 
     async def _check_weibo(self, cookie_str: str) -> bool:
-        """HTTP keepalive is NOT possible for weibo.com.
+        """Check Weibo cookie validity via ``GET weibo.com``.
 
-        Weibo actively blocks ALL non-browser HTTP requests — every endpoint
-        (``/``, ``/login``, ``/ajax/profile/info``) redirects to
-        ``login.sina.com.cn`` regardless of cookie validity.  The mobile
-        API at ``m.weibo.cn`` uses a separate auth system and refuses
-        desktop ``.weibo.com`` cookies.
-
-        The only reliable check is via Playwright (Layer 2), so this method
-        always returns ``False`` to fall through to the browser refresh.
+        A valid cookie stays on ``weibo.com``; an expired/absent one gets
+        redirected to ``passport.weibo.com`` or a visitor page.  This is the
+        same check that ``WeiboPoster.check_validity()`` in ``main.py`` uses
+        successfully — douyin's anti-bot measures are the aggressive ones,
+        not Weibo's desktop site.
         """
-        return False
+        import aiohttp
+
+        try:
+            headers = {
+                "User-Agent": self.cfg["user_agent"],
+                "Cookie": cookie_str,
+            }
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://weibo.com",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.KEEPALIVE_TIMEOUT),
+                    allow_redirects=True,
+                ) as resp:
+                    url = str(resp.url)
+                    valid = (
+                        "passport.weibo.com" not in url
+                        and "visitor" not in url.lower()
+                    )
+                    if not valid:
+                        print(
+                            f"[Keepalive] Weibo cookie INVALID — "
+                            f"redirected to {url[:80]}",
+                            flush=True,
+                        )
+                    return valid
+        except Exception as e:
+            print(
+                f"[Keepalive] Weibo cookie check error: {e}",
+                flush=True,
+            )
+            return False
 
     async def _check_bilibili(self, cookie_str: str) -> bool:
         """Check via the nav API — ``code == 0`` means authenticated."""
