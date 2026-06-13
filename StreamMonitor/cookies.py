@@ -1132,6 +1132,11 @@ async def _refresher_loop(platform: str, interval: int | None = None):
 
     *interval* overrides the platform default (used when PM2 passes
     an argument like ``21600`` via ``sys.argv``).
+
+    Polls cookie health every 60s so that when another process (e.g.
+    ``streammonitor``) marks the cookie as ``"expired"`` via
+    ``mark_unhealthy()``, the refresher reacts within a minute instead
+    of waiting for the next full interval.
     """
     cfg = PLATFORM[platform]
     if interval is None:
@@ -1154,16 +1159,32 @@ async def _refresher_loop(platform: str, interval: int | None = None):
 
     # Run immediately so we don't wait N hours for initial data
     print(f"[{platform}] Running initial refresh...", flush=True)
-    success, test_ok = await refresher.refresh()
+    await refresher.refresh()
+
+    POLL = 60  # wake every 60s to check for emergency triggers
 
     while True:
-        await asyncio.sleep(interval)
-        print(
-            f"\n[{platform}] Scheduled refresh at "
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            flush=True,
-        )
-        await refresher.refresh()
+        # Sleep in short increments so we can detect health=expired
+        # between the long scheduled intervals.
+        for _ in range(interval // POLL):
+            await asyncio.sleep(POLL)
+            data = refresher.pool.get_active()
+            if data.get("health") == "expired":
+                print(
+                    f"[{platform}] Health=expired detected — "
+                    f"forcing immediate refresh",
+                    flush=True,
+                )
+                await refresher.refresh()
+                break  # restart the interval timer from zero
+        else:
+            # Normal scheduled refresh (no emergency trigger this cycle)
+            print(
+                f"\n[{platform}] Scheduled refresh at "
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                flush=True,
+            )
+            await refresher.refresh()
 
 
 def main_douyin():
