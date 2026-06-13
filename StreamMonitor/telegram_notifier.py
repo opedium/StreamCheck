@@ -30,6 +30,37 @@ class TelegramNotifier:
     def configured(self):
         return bool(self.bot_token and self.chat_id)
 
+    def send_photo(self, photo_bytes: bytes, caption: str = "") -> bool:
+        """Send a photo to Telegram.
+
+        Args:
+            photo_bytes: Raw PNG image bytes.
+            caption: Optional caption text.
+
+        Returns True if sent, False on failure.
+        """
+        if not self.configured:
+            print("[Telegram] Not configured — photo not sent", flush=True)
+            return False
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{self.bot_token}/sendPhoto",
+                files={"photo": ("qr.png", photo_bytes, "image/png")},
+                data={"chat_id": self.chat_id, "caption": caption},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                print(f"[Telegram] Photo sent: {caption[:80]}", flush=True)
+                return True
+            print(
+                f"[Telegram] Photo HTTP {resp.status_code}: {resp.text[:200]}",
+                flush=True,
+            )
+            return False
+        except Exception as e:
+            print(f"[Telegram] Photo error: {e}", flush=True)
+            return False
+
     def send(self, message, state=None):
         """Send a Telegram message.
 
