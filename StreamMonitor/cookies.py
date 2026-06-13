@@ -368,7 +368,13 @@ class KeepaliveChecker:
         return await method(cookie_str)
 
     async def _check_douyin(self, cookie_str: str) -> bool:
-        """GET ``/user/self`` — alive if not redirected to passport."""
+        """GET ``/user/self`` — alive if not redirected to passport.
+
+        Also performs a secondary SSR-based ``isLogin`` check by fetching
+        the live page with minimal headers.  The SSR check catches cases
+        where the user endpoint doesn't redirect but the session is
+        still considered invalid server-side.
+        """
         import aiohttp
 
         try:
@@ -384,13 +390,88 @@ class KeepaliveChecker:
                     allow_redirects=True,
                 ) as resp:
                     url = str(resp.url)
-                    return (
+                    redirect_alive = (
                         "passport" not in url
                         and "login" not in url
                         and resp.status == 200
                     )
         except Exception:
             return False
+
+        # Secondary check: SSR isLogin for more precise validation
+        # Even if /user/self didn't redirect, the session might be degraded.
+        if redirect_alive:
+            ssr_ok, _, _ = await self._check_douyin_ssr(cookie_str)
+            return ssr_ok
+
+        return False
+
+    async def _check_douyin_ssr(
+        self, cookie_str: str
+    ) -> tuple[bool, str, str]:
+        """Check Douyin login state via SSR ``defaultHeaderUserInfo.isLogin``.
+
+        Visits ``live.douyin.com`` with minimal headers (no ``Sec-*``) to
+        force server-side rendering, which embeds the real login state in
+        the HTML as ``window.__INITIAL_STATE__.defaultHeaderUserInfo``.
+
+        Returns:
+            ``(is_logged_in, nickname, uid)`` tuple.
+            On failure or parse error returns ``(False, '', '')``.
+        """
+        import aiohttp
+        import re
+
+        try:
+            # Minimal headers — no Sec-Ch-Ua so Douyin returns SSR HTML
+            headers = {
+                "User-Agent": self.cfg["user_agent"],
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;"
+                    "q=0.9,*/*;q=0.8"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://live.douyin.com/",
+                "Cookie": cookie_str,
+            }
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://live.douyin.com/",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.KEEPALIVE_TIMEOUT),
+                    allow_redirects=True,
+                ) as resp:
+                    body = await resp.text()
+
+            # Extract isLogin + nickname from SSR payload
+            m = re.search(
+                r'defaultHeaderUserInfo.*?isLogin.*?(true|false).*?'
+                r'nickname\\?"[,:]\\?"([^"\\]+)',
+                body, re.DOTALL
+            )
+            is_login = False
+            nickname = ""
+            if m:
+                is_login = m.group(1) == "true"
+                nickname = m.group(2)
+
+            # Extract uid
+            uid = ""
+            m_uid = re.search(
+                r'defaultHeaderUserInfo.*?uid\\?"[,:]\\?"(\d+)',
+                body, re.DOTALL
+            )
+            if m_uid:
+                uid = m_uid.group(1)
+
+            return is_login, nickname, uid
+
+        except Exception as e:
+            print(
+                f"[Keepalive] Douyin SSR check failed: {e}",
+                flush=True,
+            )
+            return False, "", ""
 
     async def _check_weibo(self, cookie_str: str) -> bool:
         """Check Weibo cookie validity via ``GET weibo.com``.
@@ -515,6 +596,30 @@ class UnifiedCookieRefresher:
                     f"[{self.platform}] Cookie still valid — skipping browser",
                     flush=True,
                 )
+
+                # For Douyin, also run SSR isLogin check for richer notification
+                if self.platform == "douyin":
+                    is_login, nickname, uid = (
+                        await self.keepalive._check_douyin_ssr(old_cookie)
+                    )
+                    self._refresh_info = {
+                        "ssr_login": is_login,
+                        "ssr_nickname": nickname,
+                        "ssr_uid": uid,
+                        "new_cookie_str": old_cookie,
+                    }
+                    if is_login:
+                        print(
+                            f"[Keepalive] SSR verified: logged in as {nickname}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[Keepalive] SSR reports NOT logged in "
+                            f"despite no redirect — may be degraded",
+                            flush=True,
+                        )
+
                 # Notify at most once per 24h so user knows the refresher
                 # is alive even when no work is needed
                 if self.notifier and (
@@ -769,12 +874,21 @@ class UnifiedCookieRefresher:
 
     @staticmethod
     def _fmt_expiry(cookie_str: str) -> str:
-        """Parse ALF / session expiry from *cookie_str* for display.
+        """Parse session expiry from *cookie_str* for display.
 
-        Only returns a value when ALF is in the future (positive days
-        remaining).  Weibo does not always update ALF on every page
-        visit, so a stale / past ALF is silently ignored.
+        Supports:
+        - Weibo ``ALF`` — unix timestamp embedded as ``ALF=<ts>`` or
+          ``ALF=<ts>_<nonce>``.
+        - Douyin ``sid_guard`` — URL-encoded pipe-delimited string where
+          the 4th field is the expiry date (``Sat, 01-Aug-2026 ...``).
+
+        Only returns a value when the expiry is in the future (positive
+        days remaining).  Stale / past expiry is silently ignored since
+        some platforms do not update the field on every page visit.
         """
+        import urllib.parse
+
+        # ── Try ALF (Weibo) ─────────────────────────────────────────
         for part in cookie_str.split(";"):
             part = part.strip()
             if part.startswith("ALF="):
@@ -785,13 +899,53 @@ class UnifiedCookieRefresher:
                     remaining = dt - datetime.now()
                     days = remaining.days
                     if days < 0:
-                        return ""  # stale ALF, ignore
+                        break  # stale ALF, fall through to sid_guard
                     label = f"{dt.strftime('%Y-%m-%d')} ({days}d)"
                     if days < 7:
                         label += " ⚠️"
                     return label
                 except Exception:
+                    break
+
+        # ── Try sid_guard (Douyin) ──────────────────────────────────
+        for part in cookie_str.split(";"):
+            part = part.strip()
+            if part.startswith("sid_guard="):
+                try:
+                    val = part.split("=", 1)[1]
+                    decoded = urllib.parse.unquote(val)
+                    fields = decoded.split("|")
+                    if len(fields) >= 4:
+                        date_str = fields[3].replace("+", " ").strip()
+                        # "Sat, 01-Aug-2026 08:14:14 GMT" → parse
+                        import re as _re
+                        m = _re.search(
+                            r"(\d+)-(\w+)-(\d+)", date_str
+                        )
+                        if m:
+                            day, mon_str, year = (
+                                m.group(1), m.group(2), m.group(3)
+                            )
+                            months = {
+                                "Jan": "01", "Feb": "02", "Mar": "03",
+                                "Apr": "04", "May": "05", "Jun": "06",
+                                "Jul": "07", "Aug": "08", "Sep": "09",
+                                "Oct": "10", "Nov": "11", "Dec": "12",
+                            }
+                            mon = months.get(mon_str[:3], "00")
+                            dt = datetime(int(year), int(mon), int(day))
+                            remaining = dt - datetime.now()
+                            days = remaining.days
+                            if days < 0:
+                                return ""  # stale
+                            label = f"{dt.strftime('%Y-%m-%d')} ({days}d)"
+                            if days < 7:
+                                label += " ⚠️"
+                            return label
+                except Exception:
                     pass
+                break  # only one sid_guard
+
         return ""
 
     @staticmethod
@@ -832,6 +986,10 @@ class UnifiedCookieRefresher:
                 parts.append("odin_tt ✅")
             if sessionid:
                 parts.append("sessionid ✅")
+            # Append session expiry from sid_guard if available
+            expiry = self._fmt_expiry(cookie_str)
+            if expiry:
+                parts.append(f"expires {expiry}")
             return "  ".join(parts)
         if self.platform == "bilibili":
             sess = extract_cookie_value(cookie_str, "SESSDATA")
@@ -858,6 +1016,21 @@ class UnifiedCookieRefresher:
         ts = datetime.now().strftime("%H:%M")
 
         if method == "keepalive":
+            # Enhanced keepalive message — include SSR login info and expiry
+            if self.platform == "douyin":
+                ri = self._refresh_info
+                ssr_login = ri.get("ssr_login", False) if ri else False
+                ssr_nick = ri.get("ssr_nickname", "") if ri else ""
+                expiry = self._fmt_expiry(
+                    ri.get("new_cookie_str", "") if ri else ""
+                )
+                nick_tag = f" {ssr_nick}" if ssr_nick else ""
+                ssr_tag = " ✅" if ssr_login else " ⚠️"
+                expiry_tag = f" expires {expiry}" if expiry else ""
+                return (
+                    f"🟢 {self.platform}{nick_tag} cookie valid"
+                    f"{ssr_tag}{expiry_tag} [{ts}]"
+                )
             return f"🟢 {self.platform} cookie still valid [{ts}]"
 
         if not success:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram bot — /refresh_douyin via SSO QR + background thread."""
+"""Telegram bot — /refresh_douyin using DYLoginApi Firefox session."""
 
 import asyncio
 import io
@@ -20,9 +20,11 @@ if _dy_path not in sys.path:
 
 from builder.params import Params
 from utils.dy_util import generate_msToken
+from dy_apis.login_api import DYLoginApi
 from telegram_notifier import TelegramNotifier
 
-_SSO_BASE = "https://sso.douyin.com/"
+
+_QR_SESSIONS = {}  # cid -> (ctx, token)
 
 
 def _sso_query() -> dict:
@@ -42,7 +44,7 @@ def _sso_query() -> dict:
     return p.get()
 
 
-def _build_url(base: str, query: dict, extra: dict = None) -> str:
+def _build_url(base, query, extra=None):
     q = dict(query)
     if extra:
         q.update(extra)
@@ -62,7 +64,6 @@ class TelegramBot:
             sys.exit(1)
         self._offset = 0
         self._poll_timeout = 30
-        self._qr_sessions = {}
 
     def _api(self, method, **kw):
         url = f"https://api.telegram.org/bot{self.token}/{method}"
@@ -94,29 +95,38 @@ class TelegramBot:
                   data={"chat_id": cid, "caption": caption})
 
     def _show_qr(self, cid):
-        """Playwright → SSO QR → send to Telegram → wait for done."""
+        """DYLoginApi Firefox session → QR → Telegram → poll → done."""
         async def _run():
             from playwright.async_api import async_playwright
 
+            # Step 1: Get Firefox session via DYLoginApi
+            api = DYLoginApi()
+            auth = await api.dyGenerateInitData()
+            print(f"[TGBot] Init {len(auth.cookie)} cookies", flush=True)
+
+            # Step 2: Launch Firefox with those cookies
             async with async_playwright() as pw:
-                ctx = await pw.chromium.launch_persistent_context(
-                    user_data_dir=f"/tmp/tgbot_qr_{cid}", headless=True,
-                    viewport={"width": 1280, "height": 720},
-                    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
-                    args=["--disable-blink-features=AutomationControlled"],
+                browser = await pw.firefox.launch(headless=True)
+                ctx = await browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
                 )
+                seeds = [{"name": k, "value": v, "domain": ".douyin.com", "path": "/"}
+                         for k, v in auth.cookie.items()]
+                await ctx.add_cookies(seeds)
+
                 page = await ctx.new_page()
                 await page.goto("https://www.douyin.com/",
                                 wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(3000)
 
-                # Intercept SSO QR response
+                # Intercept QR response
                 qr_data = {}
                 async def on_resp(resp):
                     if "get_qrcode" in resp.url and resp.ok:
                         try:
-                            j = await resp.json()
+                            body = await resp.text()
+                            j = _json.loads(body)
                             if j.get("data", {}).get("qrcode_index_url"):
                                 qr_data.update(j)
                                 print("[TGBot] QR intercepted", flush=True)
@@ -124,21 +134,20 @@ class TelegramBot:
                             pass
                 page.on("response", on_resp)
 
-                sso_url = _build_url(_SSO_BASE + "get_qrcode/", _sso_query())
-                await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
+                await page.goto(_build_url("https://sso.douyin.com/get_qrcode/", _sso_query()),
+                                wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(5000)
+
                 if not qr_data:
-                    await page.goto(sso_url, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(5000)
-                if not qr_data:
-                    self.send_message(cid, "No QR data from SSO")
-                    await ctx.close()
+                    self.send_message(cid, "No QR data")
+                    await browser.close()
                     return
 
+                token = qr_data["data"]["token"]
                 qr_url = qr_data["data"]["qrcode_index_url"]
-                print(f"[TGBot] QR OK url={qr_url[:60]}...", flush=True)
+                print(f"[TGBot] QR OK token={token[:20]}...", flush=True)
 
-                # Generate QR image from the URL using qrcode library
+                # Send QR to Telegram
                 img = qrcode.make(qr_url)
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
@@ -146,58 +155,87 @@ class TelegramBot:
                 self.send_photo(cid, buf.getvalue(),
                     caption="Scan QR with Douyin app, then send:\n/refresh_douyin_done")
 
-                self._qr_sessions[cid] = ctx
-                print(f"[TGBot] QR session started for {cid}", flush=True)
+                _QR_SESSIONS[cid] = (ctx, token)
+                print(f"[TGBot] Session active for {cid}", flush=True)
 
-                # Wait for done signal (up to 10 min)
-                for _ in range(120):
+                # Poll check_qrconnect via Firefox page navigation
+                check_data = {}
+                async def on_check(resp):
+                    if "check_qrconnect" in resp.url and resp.ok:
+                        try:
+                            body = await resp.text()
+                            j = _json.loads(body)
+                            check_data.update(j)
+                            print(f"[TGBot] Check: err={j.get('error_code', '?')}", flush=True)
+                        except Exception:
+                            pass
+                page.on("response", on_check)
+
+                for i in range(60):
                     await asyncio.sleep(5)
-                    if cid not in self._qr_sessions:
+                    if cid not in _QR_SESSIONS:
                         return
-                self.send_message(cid, "QR session timed out")
-                await ctx.close()
-                self._qr_sessions.pop(cid, None)
+                    # Don't spam check until user has had time to scan
+                    if i < 6:
+                        continue
+                    try:
+                        ck_url = _build_url("https://sso.douyin.com/check_qrconnect/",
+                                            _sso_query(), {"token": token})
+                        await page.goto(ck_url, wait_until="domcontentloaded", timeout=15000)
+                        await page.wait_for_timeout(2000)
+                        if check_data.get("error_code") == 0:
+                            self.send_message(cid, "QR scanned! Following redirect...")
+                            ru = check_data.get("data", {}).get("redirect_url", "")
+                            if ru:
+                                await page.goto(ru, wait_until="domcontentloaded", timeout=15000)
+                                await page.wait_for_timeout(3000)
+                            break
+                        elif check_data.get("error_code") == 10001:
+                            self.send_message(cid, "QR expired")
+                            _QR_SESSIONS.pop(cid, None)
+                            await browser.close()
+                            return
+                    except Exception as e:
+                        print(f"[TGBot] Check err: {e}", flush=True)
+
+                # Save cookies
+                raw = await ctx.cookies()
+                cookies = {c["name"]: c["value"] for c in raw}
+                if "msToken" not in cookies:
+                    cookies["msToken"] = generate_msToken()
+                _QR_SESSIONS.pop(cid, None)
+                await browser.close()
+
+                new_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                print(f"[TGBot] Login OK — {len(cookies)} cookies", flush=True)
+                try:
+                    from cookies import DouyinCookieManager
+                    d = DouyinCookieManager().load()
+                    d["cookie_str"] = new_str
+                    d["cookie_dict"] = cookies
+                    d["health"] = "ok"
+                    d["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    d["refresh_count"] = d.get("refresh_count", 0) + 1
+                    DouyinCookieManager().save(d)
+                    self.send_message(cid, f"Douyin QR OK — {len(cookies)} cookies saved")
+                except Exception as e:
+                    self.send_message(cid, f"Save error: {e}")
 
         asyncio.run(_run())
+        _QR_SESSIONS.pop(cid, None)
 
     def _handle_refresh_douyin(self, cid):
-        self.send_message(cid, "Launching browser...")
+        self.send_message(cid, "Launching browser (Firefox)...")
         t = threading.Thread(target=self._show_qr, args=(cid,), daemon=True)
         t.start()
 
     def _handle_done(self, cid):
-        ctx = self._qr_sessions.pop(cid, None)
-        if not ctx:
-            self.send_message(cid, "No active QR session. Send /refresh_douyin first.")
+        if cid not in _QR_SESSIONS:
+            self.send_message(cid, "No active session. Send /refresh_douyin first.")
             return
-
-        self.send_message(cid, "Saving cookies...")
-
-        async def _save():
-            page = await ctx.new_page()
-            await page.goto("https://www.douyin.com/",
-                            wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(3000)
-            raw = await ctx.cookies()
-            cookies = {c["name"]: c["value"] for c in raw}
-            if "msToken" not in cookies:
-                cookies["msToken"] = generate_msToken()
-            await ctx.close()
-
-            new_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
-            print(f"[TGBot] Login OK — {len(cookies)} cookies", flush=True)
-
-            from cookies import DouyinCookieManager
-            d = DouyinCookieManager().load()
-            d["cookie_str"] = new_str
-            d["cookie_dict"] = cookies
-            d["health"] = "ok"
-            d["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            d["refresh_count"] = d.get("refresh_count", 0) + 1
-            DouyinCookieManager().save(d)
-            self.send_message(cid, f"Douyin QR OK — {len(cookies)} cookies saved")
-
-        asyncio.run(_save())
+        self.send_message(cid, "Waiting for Firefox to detect scan...")
+        # The Firefox session is already polling check_qrconnect.
+        # Just tell the user it's working - when detected, cookies auto-save.
 
     def run(self):
         print("[TGBot] Starting...", flush=True)
